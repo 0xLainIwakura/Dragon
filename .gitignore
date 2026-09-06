@@ -1,0 +1,33 @@
+# Build artifacts
+server/build/
+output/
+*.o
+*.exe
+*.bin
+
+# Generated keys and certs (user generates with keygen)
+server_priv.bin
+server_pub.bin
+server_pub.h
+server.crt
+server.key
+
+# Generated config (CMake creates from .in template)
+client/client_config.h
+!client/client_config.h.in
+
+# MinGW dependencies (user runs setup_deps.sh)
+deps/mingw64/include/
+deps/mingw64/lib/
+deps/mingw64/lib64/
+deps/mingw64/bin/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*~
+
+# OS
+.DS_Store
+Thumbs.db

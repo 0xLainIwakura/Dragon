@@ -1,0 +1,12 @@
+#pragma once
+#include <stdint.h>
+
+#define LEVEL_CLIENT @CLIENT_LEVEL@
+#define BEACON_INTERVAL @BEACON_INTERVAL@
+#define SERVER_IP "@SERVER_IP@"
+#define SERVER_PORT @SERVER_PORT@
+#define FATHER_IP "@FATHER_IP@"
+#define FATHER_PORT @FATHER_PORT@
+#define UPSTREAM_TRANSPORT "@UPSTREAM_TRANSPORT@"
+
+#include "server_pub.h"
