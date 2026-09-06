@@ -180,6 +180,7 @@ Output files:
 Required for cross-compiling Windows clients from Linux:
 
 ```bash
+chmod +x setup_deps.sh
 ./setup_deps.sh
 ```
 
