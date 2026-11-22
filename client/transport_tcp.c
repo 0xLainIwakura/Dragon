@@ -5,6 +5,9 @@
 #include <stdlib.h>
 
 #include "transport.h"
+#include "crypto_dragon.h"
+
+#include "padding.h"
 
 #pragma comment(lib, "Ws2_32.lib")
 
@@ -17,32 +20,60 @@ struct transport_conn {
     SOCKET sock;
 };
 
+static uint16_t g_tcp_pad_min = 0;
+static uint16_t g_tcp_pad_max = 0;
+
+void tcp_set_padding(uint16_t pad_min, uint16_t pad_max)
+{
+    g_tcp_pad_min = pad_min;
+    g_tcp_pad_max = pad_max;
+}
+
+static int tcp_send_raw(SOCKET sock, const void *buf, size_t len)
+{
+    size_t sent = 0;
+    while (sent < len) {
+        int r = send(sock, (const char*)buf + sent, (int)(len - sent), 0);
+        if (r <= 0) return -1;
+        sent += r;
+    }
+    return (int)sent;
+}
+
+static int tcp_recv_raw(SOCKET sock, void *buf, size_t len)
+{
+    size_t got = 0;
+    while (got < len) {
+        int r = recv(sock, (char*)buf + got, (int)(len - got), 0);
+        if (r <= 0) return -1;
+        got += r;
+    }
+    return (int)got;
+}
+
 
 /* ========================================
    SEND
    ======================================== */
 
-static int tcp_send(
-        transport_conn_t *conn,
-        const uint8_t *buf,
-        size_t len)
+
+
+static int tcp_send( transport_conn_t *conn, const uint8_t *buf, size_t len)
 {
-    size_t sent = 0;
+    uint8_t pad[1024];
+    int pad_len = 0;
 
-    while (sent < len)
-    {
-        int r = send(conn->sock,
-                     (char*)buf + sent,
-                     len - sent,
-                     0);
+    if (len == WIRE_FRAME_SIZE && g_tcp_pad_max > 0)
+        pad_len = generate_padding(g_tcp_pad_min, g_tcp_pad_max, pad, 1024);
 
-        if (r <= 0)
-            return -1;
+    uint32_t total = htonl((uint32_t)(len + pad_len));
 
-        sent += r;
-    }
+    if (tcp_send_raw(conn->sock, &total, 4) < 0) return -1;
+    if (tcp_send_raw(conn->sock, buf, len) < 0) return -1;
+    if (pad_len > 0)
+        if (tcp_send_raw(conn->sock, pad, pad_len) < 0) return -1;
 
-    return sent;
+    return (int)len;
 }
 
 
@@ -50,27 +81,25 @@ static int tcp_send(
    RECV
    ======================================== */
 
-static int tcp_recv(
-        transport_conn_t *conn,
-        uint8_t *buf,
-        size_t len)
+static int tcp_recv(transport_conn_t *conn, uint8_t *buf, size_t len)
 {
-    size_t received = 0;
+    uint32_t net_total;
+    if (tcp_recv_raw(conn->sock, &net_total, 4) < 0) return -1;
+    uint32_t total = ntohl(net_total);
 
-    while (received < len)
-    {
-        int r = recv(conn->sock,
-                     (char*)buf + received,
-                     len - received,
-                     0);
+    if (total < (uint32_t)len) return -1;
 
-        if (r <= 0)
-            return -1;
+    if (tcp_recv_raw(conn->sock, buf, len) < 0) return -1;
 
-        received += r;
+    uint32_t remaining = total - (uint32_t)len;
+    while (remaining > 0) {
+        char discard[512];
+        uint32_t chunk = remaining > sizeof(discard) ? sizeof(discard) : remaining;
+        if (tcp_recv_raw(conn->sock, discard, chunk) < 0) return -1;
+        remaining -= chunk;
     }
 
-    return received;
+    return (int)len;
 }
 
 

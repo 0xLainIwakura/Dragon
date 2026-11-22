@@ -40,14 +40,13 @@ typedef struct transport_t {
 extern transport_t TRANSPORT_TCP;
 extern transport_t TRANSPORT_HTTP;
 extern transport_t TRANSPORT_HTTPS;
- 
-/*
- * To implement:
- * 
- * extern transport_t TRANSPORT_DNS;
- * extern transport_t TRANSPORT_SMB;
- */
- 
+extern transport_t TRANSPORT_DNS;
+
+void dns_server_set_domain(const char *domain);
+
+void http_server_set_paths(const char *data, const char *hs);
+void https_server_set_paths(const char *data, const char *hs);
+
 transport_t *transport_get(const char *name);
  
 #endif

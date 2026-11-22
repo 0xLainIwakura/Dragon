@@ -7,12 +7,14 @@ extern transport_t TRANSPORT_TCP;
 extern transport_t TRANSPORT_HTTP;
 extern transport_t TRANSPORT_HTTPS;
 extern transport_t TRANSPORT_SMB;
+extern transport_t TRANSPORT_DNS;
 
 static transport_t *transports[] = {
     &TRANSPORT_TCP,
     &TRANSPORT_HTTP,
     &TRANSPORT_HTTPS,
     &TRANSPORT_SMB,
+    &TRANSPORT_DNS,
     NULL
 };
 

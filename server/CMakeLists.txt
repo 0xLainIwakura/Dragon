@@ -13,6 +13,7 @@ add_executable(server
     transport_tcp.c
     transport_http.c
     transport_https.c
+    transport_dns.c
 )
 
 add_executable(keygen keygen.c)
@@ -22,19 +23,13 @@ find_package(Threads REQUIRED)
 find_package(OpenSSL REQUIRED)
 
 pkg_check_modules(SODIUM   REQUIRED libsodium)
-pkg_check_modules(MONGOC mongoc2)
-if(NOT MONGOC_FOUND)
-    pkg_check_modules(MONGOC REQUIRED libmongoc-1.0)
-endif()
-
-pkg_check_modules(BSON bson2)
-if(NOT BSON_FOUND)
-    pkg_check_modules(BSON REQUIRED libbson-1.0)
-endif()
+pkg_check_modules(MONGOC   REQUIRED libmongoc-1.0)
+pkg_check_modules(BSON     REQUIRED libbson-1.0)
 pkg_check_modules(READLINE REQUIRED readline)
 
 target_include_directories(server PRIVATE
     ${CMAKE_SOURCE_DIR}
+        ${CMAKE_SOURCE_DIR}/..
     ${SODIUM_INCLUDE_DIRS}
     ${MONGOC_INCLUDE_DIRS}
     ${BSON_INCLUDE_DIRS}

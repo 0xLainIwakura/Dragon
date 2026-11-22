@@ -13,14 +13,23 @@
 #include <sys/select.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
- 
 #include "transport.h"
- 
+#include "padding.h"
+#include "crypto_dragon.h"
 
 struct transport_conn {
     int fd;
     struct sockaddr_in addr;
 };
+
+static uint16_t g_tcp_pad_min = 0;
+static uint16_t g_tcp_pad_max = 0;
+
+void tcp_set_padding(uint16_t pad_min, uint16_t pad_max)
+{
+    g_tcp_pad_min = pad_min;
+    g_tcp_pad_max = pad_max;
+}
  
 /* =========================================================================
  * transport_t callbacks
@@ -91,19 +100,66 @@ static transport_conn_t *tcp_accept(int listener_fd,
     conn->addr = caddr;
     return conn;
 }
- 
-static int tcp_send(transport_conn_t *conn,
-                     const uint8_t *buf, size_t len)
+
+static int tcp_send_raw(int fd, const void *buf, size_t len)
 {
-    ssize_t n = send(conn->fd, buf, len, MSG_NOSIGNAL);
-    return (int)n;
+    size_t sent = 0;
+    while (sent < len) {
+        ssize_t r = send(fd, (const char*)buf + sent, len - sent, MSG_NOSIGNAL);
+        if (r <= 0) return -1;
+        sent += r;
+    }
+    return (int)sent;
+}
+
+static int tcp_recv_raw(int fd, void *buf, size_t len)
+{
+    size_t got = 0;
+    while (got < len) {
+        ssize_t r = recv(fd, (char*)buf + got, len - got, 0);
+        if (r <= 0) return -1;
+        got += r;
+    }
+    return (int)got;
 }
  
-static int tcp_recv(transport_conn_t *conn,
-                     uint8_t *buf, size_t len)
+static int tcp_send(transport_conn_t *conn, const uint8_t *buf, size_t len)
 {
-    ssize_t n = recv(conn->fd, buf, len, 0);
-    return (int)n;
+    uint8_t pad[1024];
+    int pad_len = 0;
+
+    if (len == WIRE_FRAME_SIZE && g_tcp_pad_max > 0)
+        pad_len = generate_padding(g_tcp_pad_min, g_tcp_pad_max, pad, 1024);
+
+    uint32_t total = htonl((uint32_t)(len + pad_len));
+
+    if (tcp_send_raw(conn->fd, &total, 4) < 0) return -1;
+    if (tcp_send_raw(conn->fd, buf, len) < 0) return -1;
+    if (pad_len > 0)
+        if (tcp_send_raw(conn->fd, pad, pad_len) < 0) return -1;
+
+    return (int)len;
+}
+ 
+static int tcp_recv(transport_conn_t *conn, uint8_t *buf, size_t len)
+{
+    uint32_t net_total;
+    if (tcp_recv_raw(conn->fd, &net_total, 4) < 0) return -1;
+    uint32_t total = ntohl(net_total);
+
+    if (total < (uint32_t)len) return -1;
+
+    if (tcp_recv_raw(conn->fd, buf, len) < 0) return -1;
+
+    uint32_t remaining = total - (uint32_t)len;
+    while (remaining > 0) {
+        char discard[512];
+        uint32_t chunk = remaining > sizeof(discard) ? sizeof(discard) : remaining;
+        if (tcp_recv_raw(conn->fd, discard, chunk) < 0) return -1;
+        remaining -= chunk;
+    }
+
+    return (int)len;
 }
  
 static int tcp_poll(transport_conn_t *conn, int timeout_ms)
